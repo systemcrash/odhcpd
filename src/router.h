@@ -43,7 +43,7 @@ struct icmpv6_opt {
 	AdvDefaultLifetime, change 9000 to 65535 seconds.
 */
 #define MaxRtrAdvInterval_CEILING		65535
-#define MinRtrAdvInterval		3
+#define MinRtrAdvInterval_FLOOR			3
 #define AdvDefaultLifetime_CEILING		65535
 /* RFC8319 §4
 	This document updates §4.2 and 6.2.1 of [RFC4861] to change

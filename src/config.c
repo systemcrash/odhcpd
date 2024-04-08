@@ -18,6 +18,7 @@
 #include <libubox/vlist.h>
 
 #include "odhcpd.h"
+#include "router.h"
 
 static struct blob_buf b;
 static int reload_pipe[2] = { -1, -1 };
@@ -227,8 +228,12 @@ static void set_interface_defaults(struct interface *iface)
 	iface->ra_flags = ND_RA_FLAG_OTHER;
 	iface->ra_slaac = true;
 	iface->ra_maxinterval = 600;
+	/*
+	 * RFC4861: MinRtrAdvInterval: Default: 0.33 * MaxRtrAdvInterval If
+	 * MaxRtrAdvInterval >= 9 seconds; otherwise, the Default is MaxRtrAdvInterval.
+	 */
 	iface->ra_mininterval = iface->ra_maxinterval/3;
-	iface->ra_lifetime = -1;
+	iface->ra_lifetime = 3 * iface->ra_maxinterval; /* RFC4861: AdvDefaultLifetime: Default: 3 * MaxRtrAdvInterval */
 	iface->ra_dns = true;
 }
 
@@ -966,14 +971,43 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 	if ((c = tb[IFACE_ATTR_RA_ADVROUTER]))
 		iface->ra_advrouter = blobmsg_get_bool(c);
 
-	if ((c = tb[IFACE_ATTR_RA_MININTERVAL]))
-		iface->ra_mininterval =  blobmsg_get_u32(c);
+	/*
+	 * RFC4861: MaxRtrAdvInterval: MUST be no less than 4 seconds and no greater than 1800 seconds.
+	 * RFC8319: MaxRtrAdvInterval: MUST be no less than 4 seconds and no greater than 65535 seconds.
+	 * Default: 600 seconds
+	 */
+	if ((c = tb[IFACE_ATTR_RA_MAXINTERVAL])){
+		uint32_t ra_maxinterval = blobmsg_get_u32(c);
+		iface->ra_maxinterval = (ra_maxinterval < 4) ? 4 :
+			(ra_maxinterval > MaxRtrAdvInterval_CEILING) ?
+				MaxRtrAdvInterval_CEILING : ra_maxinterval;
+	}
 
-	if ((c = tb[IFACE_ATTR_RA_MAXINTERVAL]))
-		iface->ra_maxinterval = blobmsg_get_u32(c);
+	/*
+	 * RFC4861: MinRtrAdvInterval: MUST be no less than 3 seconds and no greater than .75 * MaxRtrAdvInterval.
+	 * Default: 0.33 * MaxRtrAdvInterval If MaxRtrAdvInterval >= 9 seconds; otherwise, the
+	 * Default is MaxRtrAdvInterval.
+	 */
+	if ((c = tb[IFACE_ATTR_RA_MININTERVAL])){
+		uint32_t ra_mininterval = blobmsg_get_u32(c);
+		iface->ra_mininterval = (ra_mininterval < MinRtrAdvInterval_FLOOR) ? // clamp min
+			MinRtrAdvInterval_FLOOR : (ra_mininterval > 0.75 * (uint32_t)iface->ra_maxinterval) ? // clamp max
+				0.75 * (uint32_t)iface->ra_maxinterval : ra_mininterval;
+	}
 
-	if ((c = tb[IFACE_ATTR_RA_LIFETIME]))
-		iface->ra_lifetime = blobmsg_get_u32(c);
+	/* 
+	 * RFC4861: AdvDefaultLifetime: MUST be either zero or between MaxRtrAdvInterval and 9000 seconds.
+	 * RFC8319: AdvDefaultLifetime: MUST be either zero or between MaxRtrAdvInterval and 65535 seconds.
+	 * Default: 3 * MaxRtrAdvInterval
+	 * i.e. 3 * 65535 => 65535 seconds.
+	 */
+	if ((c = tb[IFACE_ATTR_RA_LIFETIME])){
+		uint32_t ra_lifetime = blobmsg_get_u32(c);
+		iface->ra_lifetime = (ra_lifetime == 0) ? 0 : // leave at 0
+			(ra_lifetime < (uint32_t)iface->ra_maxinterval) ? (uint32_t)iface->ra_maxinterval : // clamp min
+				(ra_lifetime > AdvDefaultLifetime_CEILING) ? 
+					AdvDefaultLifetime_CEILING : ra_lifetime; // clamp max
+	}
 
 	if ((c = tb[IFACE_ATTR_RA_USELEASETIME]))
 		iface->ra_useleasetime = blobmsg_get_bool(c);
