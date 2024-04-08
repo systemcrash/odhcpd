@@ -600,6 +600,13 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 
 			if (iface->ra_useleasetime && valid_lt > iface->dhcp_leasetime)
 				valid_lt = iface->dhcp_leasetime;
+
+			/* currently the only way to control ULA valid_lifetime */
+			if (valid_lt > iface->valid_lifetime) {
+				// set to possibly user mandated valid_lifetime
+				valid_lt = iface->valid_lifetime;
+			}
+
 		}
 
 		if (preferred_lt > valid_lt) {
