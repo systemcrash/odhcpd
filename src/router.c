@@ -382,8 +382,10 @@ static uint32_t calc_ra_lifetime(struct interface *iface, uint32_t maxival)
 		lifetime = iface->ra_lifetime;
 		if (lifetime > 0 && lifetime < maxival)
 			lifetime = maxival;
-		else if (lifetime > 9000)
-			lifetime = 9000;
+		/* // RouterLifetime is a 16 bit packet field: skip this check
+		else if (lifetime > RouterLifetime_MAX)
+			lifetime = RouterLifetime_MAX;
+		*/
 	}
 
 	return lifetime;
