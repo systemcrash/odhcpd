@@ -93,6 +93,7 @@ enum {
 	IFACE_ATTR_NDPROXY_SLAVE,
 	IFACE_ATTR_PREFIX_FILTER,
 	IFACE_ATTR_PREFERRED_LIFETIME,
+	IFACE_ATTR_VALID_LIFETIME,
 	IFACE_ATTR_NTP,
 	IFACE_ATTR_MAX
 };
@@ -146,6 +147,7 @@ static const struct blobmsg_policy iface_attrs[IFACE_ATTR_MAX] = {
 	[IFACE_ATTR_NDPROXY_SLAVE] = { .name = "ndproxy_slave", .type = BLOBMSG_TYPE_BOOL },
 	[IFACE_ATTR_PREFIX_FILTER] = { .name = "prefix_filter", .type = BLOBMSG_TYPE_STRING },
 	[IFACE_ATTR_PREFERRED_LIFETIME] = { .name = "preferred_lifetime", .type = BLOBMSG_TYPE_STRING },
+	[IFACE_ATTR_VALID_LIFETIME] = { .name = "valid_lifetime", .type = BLOBMSG_TYPE_STRING },
 	[IFACE_ATTR_NTP] = { .name = "ntp", .type = BLOBMSG_TYPE_ARRAY },
 };
 
@@ -217,6 +219,7 @@ static void set_interface_defaults(struct interface *iface)
 	iface->learn_routes = 1;
 	iface->dhcp_leasetime = 43200;
 	iface->preferred_lifetime = 604800; /* rfc4861#section-6.2.1: AdvPreferredLifetime 7 days */
+	iface->valid_lifetime = 2592000; /* rfc4861#section-6.2.1: AdvValidLifetime 30 days */
 	iface->dhcpv4_start.s_addr = htonl(START_DEFAULT);
 	iface->dhcpv4_end.s_addr = htonl(START_DEFAULT + LIMIT_DEFAULT - 1);
 	iface->dhcpv6_assignall = true;
@@ -656,6 +659,17 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 		else
 			syslog(LOG_ERR, "Invalid %s value configured for interface '%s'",
 					iface_attrs[IFACE_ATTR_PREFERRED_LIFETIME].name, iface->name);
+
+	}
+
+	if ((c = tb[IFACE_ATTR_VALID_LIFETIME])) {
+		uint32_t time = (uint32_t)parse_leasetime(c);
+
+		if (time >= 0)
+			iface->valid_lifetime = time;
+		else
+			syslog(LOG_ERR, "Invalid %s value configured for interface '%s'",
+				   iface_attrs[IFACE_ATTR_VALID_LIFETIME].name, iface->name);
 
 	}
 

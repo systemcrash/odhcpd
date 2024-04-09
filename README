@@ -155,6 +155,8 @@ prefix_filter		string	::/0			Only advertise on-link prefixes within
 							filtered out.
 ntp			list	<local address>		NTP servers to announce
 							accepts IPv4 and IPv6
+valid_lifetime		string	30d			Value for the valid lifetime
+							for a prefix
 
 
 Sections of type host (static leases)
