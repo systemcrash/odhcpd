@@ -59,6 +59,7 @@ enum {
 	IFACE_ATTR_NDP,
 	IFACE_ATTR_ROUTER,
 	IFACE_ATTR_DNS,
+	IFACE_ATTR_DNS_SEARCH,
 	IFACE_ATTR_DNS_SERVICE,
 	IFACE_ATTR_DOMAIN,
 	IFACE_ATTR_FILTER_CLASS,
@@ -112,6 +113,7 @@ static const struct blobmsg_policy iface_attrs[IFACE_ATTR_MAX] = {
 	[IFACE_ATTR_NDP] = { .name = "ndp", .type = BLOBMSG_TYPE_STRING },
 	[IFACE_ATTR_ROUTER] = { .name = "router", .type = BLOBMSG_TYPE_ARRAY },
 	[IFACE_ATTR_DNS] = { .name = "dns", .type = BLOBMSG_TYPE_ARRAY },
+	[IFACE_ATTR_DNS_SEARCH] = { .name = "dns_search", .type = BLOBMSG_TYPE_ARRAY },
 	[IFACE_ATTR_DNS_SERVICE] = { .name = "dns_service", .type = BLOBMSG_TYPE_BOOL },
 	[IFACE_ATTR_DOMAIN] = { .name = "domain", .type = BLOBMSG_TYPE_ARRAY },
 	[IFACE_ATTR_FILTER_CLASS] = { .name = "filter_class", .type = BLOBMSG_TYPE_STRING },
@@ -810,7 +812,7 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 	if ((c = tb[IFACE_ATTR_DNS_SERVICE]))
 		iface->dns_service = blobmsg_get_bool(c);
 
-	if ((c = tb[IFACE_ATTR_DOMAIN])) {
+	if ((c = tb[IFACE_ATTR_DOMAIN]) || (c = tb[IFACE_ATTR_DNS_SEARCH])) {
 		struct blob_attr *cur;
 		unsigned rem;
 
@@ -829,10 +831,17 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 			if (domainlen > 0 && domain[domainlen - 1] == '.')
 				domain[domainlen - 1] = 0;
 
+			syslog(LOG_DEBUG, "Found %s", (c = tb[IFACE_ATTR_DOMAIN]) ? 
+				iface_attrs[IFACE_ATTR_DOMAIN].name : 
+				iface_attrs[IFACE_ATTR_DNS_SEARCH].name);
+			syslog(LOG_DEBUG, "domain %s; length %d ", domain, domainlen);
+
 			len = dn_comp(domain, buf, sizeof(buf), NULL, NULL);
 			if (len <= 0) {
 				syslog(LOG_ERR, "Invalid %s value configured for interface '%s'",
-				       iface_attrs[IFACE_ATTR_DOMAIN].name, iface->name);
+ 					(c = tb[IFACE_ATTR_DOMAIN]) ? 
+					iface_attrs[IFACE_ATTR_DOMAIN].name : 
+					iface_attrs[IFACE_ATTR_DNS_SEARCH].name, iface->name);
 
 				continue;
 			}
@@ -1314,6 +1323,19 @@ void odhcpd_reload(void)
 			struct uci_section* s = uci_to_section(e);
 			if (!strcmp(s->type, "host"))
 				set_lease_from_uci(s);
+		}
+	}
+
+	struct uci_package *network = NULL;
+	if (!uci_load(uci, "network", &network)) {
+		struct uci_element *e;
+
+		/* 4. Interface settings */
+		uci_foreach_element(&network->sections, e) {
+			struct uci_section* s = uci_to_section(e);
+			if (!strcmp(s->type, "interface")){
+				set_interface(s);
+			}
 		}
 	}
 
