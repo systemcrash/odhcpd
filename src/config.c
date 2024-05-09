@@ -359,9 +359,9 @@ static void set_config(struct uci_section *s)
 	}
 }
 
-static double parse_leasetime(struct blob_attr *c) {
+static uint32_t parse_leasetime(struct blob_attr *c) {
 	char *val = blobmsg_get_string(c), *endptr = NULL;
-	double time = strcmp(val, "infinite") ? strtod(val, &endptr) : UINT32_MAX;
+	uint32_t time = strcmp(val, "infinite") ? (uint32_t)strtod(val, &endptr) : UINT32_MAX;
 
 	if (time && endptr && endptr[0]) {
 		switch(endptr[0]) {
@@ -380,7 +380,7 @@ static double parse_leasetime(struct blob_attr *c) {
 	return time;
 
 err:
-	return -1;
+	return 0;
 }
 
 static void free_lease(struct lease *l)
@@ -443,8 +443,8 @@ int set_lease_from_blobmsg(struct blob_attr *ba)
 	}
 
 	if ((c = tb[LEASE_ATTR_LEASETIME])) {
-		double time = parse_leasetime(c);
-		if (time < 0)
+		uint32_t time = parse_leasetime(c);
+		if (time == 0)
 			goto err;
 
 		l->leasetime = time;
@@ -641,9 +641,9 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 		iface->no_dynamic_dhcp = !blobmsg_get_bool(c);
 
 	if ((c = tb[IFACE_ATTR_LEASETIME])) {
-		double time = parse_leasetime(c);
+		uint32_t time = parse_leasetime(c);
 
-		if (time >= 0)
+		if (time > 0)
 			iface->dhcp_leasetime = time;
 		else
 			syslog(LOG_ERR, "Invalid %s value configured for interface '%s'",
@@ -652,9 +652,9 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 	}
 
 	if ((c = tb[IFACE_ATTR_PREFERRED_LIFETIME])) {
-		double time = parse_leasetime(c);
+		uint32_t time = parse_leasetime(c);
 
-		if (time >= 0)
+		if (time > 0)
 			iface->preferred_lifetime = time;
 		else
 			syslog(LOG_ERR, "Invalid %s value configured for interface '%s'",
@@ -663,9 +663,9 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 	}
 
 	if ((c = tb[IFACE_ATTR_VALID_LIFETIME])) {
-		uint32_t time = (uint32_t)parse_leasetime(c);
+		uint32_t time = parse_leasetime(c);
 
-		if (time >= 0)
+		if (time > 0)
 			iface->valid_lifetime = time;
 		else
 			syslog(LOG_ERR, "Invalid %s value configured for interface '%s'",
