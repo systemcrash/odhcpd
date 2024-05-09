@@ -366,17 +366,14 @@ static int calc_adv_interval(struct interface *iface, uint32_t lowest_found_life
 
 static uint32_t calc_ra_lifetime(struct interface *iface, uint32_t maxival)
 {
-	uint32_t lifetime = 3*maxival;
+	uint32_t lifetime = iface->ra_lifetime;
 
-	if (iface->ra_lifetime >= 0) {
-		lifetime = iface->ra_lifetime;
-		if (lifetime > 0 && lifetime < maxival)
-			lifetime = maxival;
-		/* // RouterLifetime is a 16 bit packet field: skip this check
-		else if (lifetime > RouterLifetime_MAX)
-			lifetime = RouterLifetime_MAX;
-		*/
-	}
+	if (lifetime > 0 && lifetime < maxival)
+		lifetime = maxival;
+	/* // RouterLifetime is a 16 bit packet field: skip this check
+	else if (lifetime > RouterLifetime_MAX)
+		lifetime = RouterLifetime_MAX;
+	*/
 
 	return lifetime;
 }
