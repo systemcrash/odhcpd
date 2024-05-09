@@ -991,8 +991,8 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 	if ((c = tb[IFACE_ATTR_RA_MININTERVAL])){
 		uint32_t ra_mininterval = blobmsg_get_u32(c);
 		iface->ra_mininterval = (ra_mininterval < MinRtrAdvInterval_FLOOR) ? // clamp min
-			MinRtrAdvInterval_FLOOR : (ra_mininterval > 0.75 * (uint32_t)iface->ra_maxinterval) ? // clamp max
-				0.75 * (uint32_t)iface->ra_maxinterval : ra_mininterval;
+			MinRtrAdvInterval_FLOOR : (ra_mininterval > 0.75 * iface->ra_maxinterval) ? // clamp max
+				0.75 * iface->ra_maxinterval : ra_mininterval;
 	}
 
 	/* 
@@ -1004,7 +1004,7 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 	if ((c = tb[IFACE_ATTR_RA_LIFETIME])){
 		uint32_t ra_lifetime = blobmsg_get_u32(c);
 		iface->ra_lifetime = (ra_lifetime == 0) ? 0 : // leave at 0
-			(ra_lifetime < (uint32_t)iface->ra_maxinterval) ? (uint32_t)iface->ra_maxinterval : // clamp min
+			(ra_lifetime < iface->ra_maxinterval) ? iface->ra_maxinterval : // clamp min
 				(ra_lifetime > AdvDefaultLifetime_CEILING) ? 
 					AdvDefaultLifetime_CEILING : ra_lifetime; // clamp max
 	}
