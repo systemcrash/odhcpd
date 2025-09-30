@@ -19,6 +19,7 @@
 #include <resolv.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <stdbool.h>
 #include <arpa/inet.h>
@@ -37,6 +38,8 @@ static void handle_icmpv6(void *addr, void *data, size_t len,
 		struct interface *iface, void *dest);
 static void trigger_router_advert(struct uloop_timeout *event);
 static void router_netevent_cb(unsigned long event, struct netevent_handler_info *info);
+static bool check_upstream_active(const struct interface *iface);
+static void send_router_advert_upstream_change(struct interface *iface, bool upstream_active);
 
 static struct netevent_handler router_netevent_handler = { .cb = router_netevent_cb, };
 
@@ -227,7 +230,7 @@ out:
 
 static void router_netevent_cb(unsigned long event, struct netevent_handler_info *info)
 {
-	struct interface *iface;
+	struct interface *iface, *c;
 
 	switch (event) {
 	case NETEV_IFINDEX_CHANGE:
@@ -238,6 +241,22 @@ static void router_netevent_cb(unsigned long event, struct netevent_handler_info
 
 			close(iface->router_event.uloop.fd);
 			iface->router_event.uloop.fd = -1;
+		}
+
+		/* Check if this is an upstream interface change */
+		if (iface) {
+			avl_for_each_element(&interfaces, c, avl) {
+				if (c->ra != MODE_SERVER || c->master || !c->upstream_len)
+					continue;
+
+				/* Check if the changed interface is an upstream for this interface */
+				char *f = memmem(c->upstream, c->upstream_len,
+						iface->name, strlen(iface->name) + 1);
+				if (f && (f == c->upstream || f[-1] == 0)) {
+					bool upstream_active = check_upstream_active(c);
+					send_router_advert_upstream_change(c, upstream_active);
+				}
+			}
 		}
 		break;
 	case NETEV_ROUTE6_ADD:
@@ -258,6 +277,217 @@ static void router_netevent_cb(unsigned long event, struct netevent_handler_info
 	default:
 		break;
 	}
+}
+
+
+/* Check if any upstream interface is active (running) */
+static bool check_upstream_active(const struct interface *iface)
+{
+	struct interface *c;
+	bool upstream_active = false;
+
+	if (!iface->upstream_len)
+		return true; /* No upstream configured, always active */
+
+	/* Iterate through all interfaces to check if any upstream is active */
+	avl_for_each_element(&interfaces, c, avl) {
+		char *f = memmem(iface->upstream, iface->upstream_len,
+				c->name, strlen(c->name) + 1);
+		if (f && (f == iface->upstream || f[-1] == 0)) {
+			/* This is an upstream interface for iface */
+			if (c->ifflags & IFF_RUNNING) {
+				upstream_active = true;
+				break;
+			}
+		}
+	}
+
+	return upstream_active;
+}
+
+
+/* Send router advertisement with zero lifetimes when upstream goes down */
+static void send_router_advert_upstream_change(struct interface *iface, bool upstream_active)
+{
+	time_t now = odhcpd_time();
+	struct odhcpd_ipaddr *addrs = NULL;
+	struct adv_msg adv;
+	struct nd_opt_prefix_info *pfxs = NULL;
+	struct iovec iov[IOV_RA_TOTAL];
+	struct sockaddr_in6 dest;
+	size_t pfxs_cnt = 0;
+	size_t valid_addr_cnt = 0;
+	int hlim = iface->ra_hoplimit;
+	int mtu = iface->ra_mtu;
+	char buf[INET6_ADDRSTRLEN];
+
+	if (iface->ra != MODE_SERVER || iface->master)
+		return;
+
+	if (!iface->have_link_local) {
+		syslog(LOG_NOTICE, "Skip sending upstream change RA on %s as no link local address is available", iface->name);
+		return;
+	}
+
+	syslog(LOG_NOTICE, "Upstream %s on %s, sending RA with %s lifetimes",
+		upstream_active ? "active" : "inactive", iface->name,
+		upstream_active ? "normal" : "zero");
+
+	memset(&adv, 0, sizeof(adv));
+	memset(iov, 0, sizeof(iov));
+	adv.h.nd_ra_type = ND_ROUTER_ADVERT;
+
+	if (hlim == 0)
+		hlim = odhcpd_get_interface_config(iface->ifname, "hop_limit");
+
+	if (hlim > 0)
+		adv.h.nd_ra_curhoplimit = hlim;
+
+	adv.h.nd_ra_flags_reserved = iface->ra_flags;
+
+	if (iface->route_preference < 0)
+		adv.h.nd_ra_flags_reserved |= ND_RA_PREF_LOW;
+	else if (iface->route_preference > 0)
+		adv.h.nd_ra_flags_reserved |= ND_RA_PREF_HIGH;
+
+	adv.h.nd_ra_reachable = htonl(iface->ra_reachabletime);
+	adv.h.nd_ra_retransmit = htonl(iface->ra_retranstime);
+
+	/* Set router lifetime to 0 when upstream is down */
+	adv.h.nd_ra_router_lifetime = upstream_active ? htons(iface->ra_lifetime >= 0 ? iface->ra_lifetime : 1800) : 0;
+
+	adv.lladdr.type = ND_OPT_SOURCE_LINKADDR;
+	adv.lladdr.len = 1;
+	odhcpd_get_mac(iface, adv.lladdr.data);
+
+	adv.mtu.nd_opt_mtu_type = ND_OPT_MTU;
+	adv.mtu.nd_opt_mtu_len = 1;
+
+	if (mtu == 0)
+		mtu = odhcpd_get_interface_config(iface->ifname, "mtu");
+
+	if (mtu < 1280)
+		mtu = 1280;
+
+	adv.mtu.nd_opt_mtu_mtu = htonl(mtu);
+
+	iov[IOV_RA_ADV].iov_base = (char *)&adv;
+	iov[IOV_RA_ADV].iov_len = sizeof(adv);
+
+	valid_addr_cnt = iface->addr6_len;
+
+	if (valid_addr_cnt) {
+		addrs = alloca(sizeof(*addrs) * valid_addr_cnt);
+		memcpy(addrs, iface->addr6, sizeof(*addrs) * valid_addr_cnt);
+
+		/* Construct Prefix Information options */
+		for (size_t i = 0; i < valid_addr_cnt; ++i) {
+			struct odhcpd_ipaddr *addr = &addrs[i];
+			struct nd_opt_prefix_info *p = NULL;
+			uint32_t preferred_lt = 0;
+			uint32_t valid_lt = 0;
+
+			if (addr->prefix > 96 || addr->valid_lt <= (uint32_t)now) {
+				syslog(LOG_INFO, "Address %s (prefix %d, valid-lifetime %u) not suitable as RA prefix on %s",
+					inet_ntop(AF_INET6, &addr->addr.in6, buf, sizeof(buf)), addr->prefix,
+					addr->valid_lt, iface->name);
+				continue;
+			}
+
+			if (ADDR_MATCH_PIO_FILTER(addr, iface)) {
+				syslog(LOG_INFO, "Address %s filtered out as RA prefix on %s",
+						inet_ntop(AF_INET6, &addr->addr.in6, buf, sizeof(buf)),
+						iface->name);
+				continue;
+			}
+
+			for (size_t j = 0; j < pfxs_cnt; ++j) {
+				if (addr->prefix == pfxs[j].nd_opt_pi_prefix_len &&
+						!odhcpd_bmemcmp(&pfxs[j].nd_opt_pi_prefix,
+						&addr->addr.in6, addr->prefix))
+					p = &pfxs[j];
+			}
+
+			if (!p) {
+				struct nd_opt_prefix_info *tmp;
+
+				tmp = realloc(pfxs, sizeof(*pfxs) * (pfxs_cnt + 1));
+				if (!tmp) {
+					syslog(LOG_ERR, "Realloc failed for RA prefix option on %s", iface->name);
+					continue;
+				}
+
+				pfxs = tmp;
+				p = &pfxs[pfxs_cnt++];
+				memset(p, 0, sizeof(*p));
+			}
+
+			/* Set lifetimes to zero if upstream is down, otherwise use normal lifetimes */
+			if (upstream_active) {
+				if (addr->preferred_lt > (uint32_t)now) {
+					preferred_lt = TIME_LEFT(addr->preferred_lt, now);
+
+					if (iface->max_preferred_lifetime && preferred_lt > iface->max_preferred_lifetime)
+						preferred_lt = iface->max_preferred_lifetime;
+				}
+
+				if (addr->valid_lt > (uint32_t)now) {
+					valid_lt = TIME_LEFT(addr->valid_lt, now);
+
+					if (iface->max_valid_lifetime && valid_lt > iface->max_valid_lifetime)
+						valid_lt = iface->max_valid_lifetime;
+				}
+
+				if (preferred_lt > valid_lt)
+					preferred_lt = valid_lt;
+			} else {
+				/* Upstream is down, set lifetimes to zero */
+				preferred_lt = 0;
+				valid_lt = 0;
+			}
+
+			odhcpd_bmemcpy(&p->nd_opt_pi_prefix, &addr->addr.in6,
+					(iface->ra_advrouter) ? 128 : addr->prefix);
+			p->nd_opt_pi_type = ND_OPT_PREFIX_INFORMATION;
+			p->nd_opt_pi_len = 4;
+			p->nd_opt_pi_prefix_len = (addr->prefix < 64) ? 64 : addr->prefix;
+			p->nd_opt_pi_flags_reserved = 0;
+			if (!iface->ra_not_onlink)
+				p->nd_opt_pi_flags_reserved |= ND_OPT_PI_FLAG_ONLINK;
+			if (iface->ra_slaac && addr->prefix <= 64)
+				p->nd_opt_pi_flags_reserved |= ND_OPT_PI_FLAG_AUTO;
+			if (iface->ra_advrouter)
+				p->nd_opt_pi_flags_reserved |= ND_OPT_PI_FLAG_RADDR;
+			p->nd_opt_pi_preferred_time = htonl(preferred_lt);
+			p->nd_opt_pi_valid_time = htonl(valid_lt);
+		}
+	}
+
+	iov[IOV_RA_PFXS].iov_base = (char *)pfxs;
+	iov[IOV_RA_PFXS].iov_len = pfxs_cnt * sizeof(*pfxs);
+
+	/* Set other iov elements to zero/empty */
+	iov[IOV_RA_ROUTES].iov_base = NULL;
+	iov[IOV_RA_ROUTES].iov_len = 0;
+	iov[IOV_RA_DNS].iov_base = NULL;
+	iov[IOV_RA_DNS].iov_len = 0;
+	iov[IOV_RA_SEARCH].iov_base = NULL;
+	iov[IOV_RA_SEARCH].iov_len = 0;
+	iov[IOV_RA_PREF64].iov_base = NULL;
+	iov[IOV_RA_PREF64].iov_len = 0;
+	iov[IOV_RA_DNR].iov_base = NULL;
+	iov[IOV_RA_DNR].iov_len = 0;
+	iov[IOV_RA_ADV_INTERVAL].iov_base = NULL;
+	iov[IOV_RA_ADV_INTERVAL].iov_len = 0;
+
+	memset(&dest, 0, sizeof(dest));
+	dest.sin6_family = AF_INET6;
+	inet_pton(AF_INET6, ALL_IPV6_NODES, &dest.sin6_addr);
+
+	if (odhcpd_send(iface->router_event.uloop.fd, &dest, iov, ARRAY_SIZE(iov), iface) > 0)
+		iface->ra_sent++;
+
+	free(pfxs);
 }
 
 
