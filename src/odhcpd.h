@@ -135,6 +135,7 @@ struct odhcpd_ipaddr {
 	uint8_t prefix;
 	uint32_t preferred_lt;
 	uint32_t valid_lt;
+	int source_ifindex;  /* Interface index where this address was assigned (0 if unknown) */
 
 	union {
 		/* ipv6 only */

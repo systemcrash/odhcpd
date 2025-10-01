@@ -619,6 +619,7 @@ static int cb_addr_valid(struct nl_msg *msg, void *arg)
 
 	memset(&addrs[ctxt->ret], 0, sizeof(addrs[ctxt->ret]));
 	addrs[ctxt->ret].prefix = ifa->ifa_prefixlen;
+	addrs[ctxt->ret].source_ifindex = ifa->ifa_index;  /* Track which interface this address is on */
 
 	nla_memcpy(&addrs[ctxt->ret].addr, nla_addr,
 			sizeof(addrs[ctxt->ret].addr));

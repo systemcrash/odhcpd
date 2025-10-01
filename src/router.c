@@ -39,7 +39,7 @@ static void handle_icmpv6(void *addr, void *data, size_t len,
 static void trigger_router_advert(struct uloop_timeout *event);
 static void router_netevent_cb(unsigned long event, struct netevent_handler_info *info);
 static bool check_upstream_active(const struct interface *iface);
-static void send_router_advert_upstream_change(struct interface *iface, bool upstream_active);
+static void send_router_advert_upstream_change(struct interface *iface, struct interface *changed_upstream);
 
 static struct netevent_handler router_netevent_handler = { .cb = router_netevent_cb, };
 
@@ -253,8 +253,8 @@ static void router_netevent_cb(unsigned long event, struct netevent_handler_info
 				char *f = memmem(c->upstream, c->upstream_len,
 						iface->name, strlen(iface->name) + 1);
 				if (f && (f == c->upstream || f[-1] == 0)) {
-					bool upstream_active = check_upstream_active(c);
-					send_router_advert_upstream_change(c, upstream_active);
+					/* Pass the upstream interface that changed */
+					send_router_advert_upstream_change(c, iface);
 				}
 			}
 		}
@@ -306,8 +306,8 @@ static bool check_upstream_active(const struct interface *iface)
 }
 
 
-/* Send router advertisement with zero lifetimes when upstream goes down */
-static void send_router_advert_upstream_change(struct interface *iface, bool upstream_active)
+/* Send router advertisement with appropriate lifetimes based on upstream interface status */
+static void send_router_advert_upstream_change(struct interface *iface, struct interface *changed_upstream)
 {
 	time_t now = odhcpd_time();
 	struct odhcpd_ipaddr *addrs = NULL;
@@ -319,6 +319,7 @@ static void send_router_advert_upstream_change(struct interface *iface, bool ups
 	size_t valid_addr_cnt = 0;
 	int hlim = iface->ra_hoplimit;
 	int mtu = iface->ra_mtu;
+	bool upstream_active = false;
 	char buf[INET6_ADDRSTRLEN];
 
 	if (iface->ra != MODE_SERVER || iface->master)
@@ -329,9 +330,13 @@ static void send_router_advert_upstream_change(struct interface *iface, bool ups
 		return;
 	}
 
-	syslog(LOG_NOTICE, "Upstream %s on %s, sending RA with %s lifetimes",
-		upstream_active ? "active" : "inactive", iface->name,
-		upstream_active ? "normal" : "zero");
+	/* Check if the changed upstream interface is still running */
+	if (changed_upstream)
+		upstream_active = (changed_upstream->ifflags & IFF_RUNNING) != 0;
+
+	syslog(LOG_NOTICE, "Upstream %s (%s) on %s, sending RA with selective lifetimes",
+		changed_upstream ? changed_upstream->name : "unknown",
+		upstream_active ? "active" : "inactive", iface->name);
 
 	memset(&adv, 0, sizeof(adv));
 	memset(iov, 0, sizeof(iov));
@@ -353,8 +358,9 @@ static void send_router_advert_upstream_change(struct interface *iface, bool ups
 	adv.h.nd_ra_reachable = htonl(iface->ra_reachabletime);
 	adv.h.nd_ra_retransmit = htonl(iface->ra_retranstime);
 
-	/* Set router lifetime to 0 when upstream is down */
-	adv.h.nd_ra_router_lifetime = upstream_active ? htons(iface->ra_lifetime >= 0 ? iface->ra_lifetime : 1800) : 0;
+	/* Set router lifetime based on overall upstream status */
+	bool any_upstream_active = check_upstream_active(iface);
+	adv.h.nd_ra_router_lifetime = any_upstream_active ? htons(iface->ra_lifetime >= 0 ? iface->ra_lifetime : 1800) : 0;
 
 	adv.lladdr.type = ND_OPT_SOURCE_LINKADDR;
 	adv.lladdr.len = 1;
@@ -422,8 +428,24 @@ static void send_router_advert_upstream_change(struct interface *iface, bool ups
 				memset(p, 0, sizeof(*p));
 			}
 
-			/* Set lifetimes to zero if upstream is down, otherwise use normal lifetimes */
-			if (upstream_active) {
+			/* 
+			 * Determine lifetimes based on prefix source:
+			 * - If the prefix came from the changed upstream interface and it's down, set lifetimes to zero
+			 * - Otherwise, use normal lifetimes
+			 */
+			bool set_zero_lifetime = false;
+			if (changed_upstream && !upstream_active) {
+				/* Check if this prefix came from the upstream interface that went down */
+				if (addr->source_ifindex == changed_upstream->ifindex) {
+					set_zero_lifetime = true;
+					syslog(LOG_DEBUG, "Prefix %s/%d on %s came from upstream %s (ifindex %d), setting zero lifetime",
+						inet_ntop(AF_INET6, &addr->addr.in6, buf, sizeof(buf)), addr->prefix,
+						iface->name, changed_upstream->name, changed_upstream->ifindex);
+				}
+			}
+
+			if (!set_zero_lifetime) {
+				/* Use normal lifetimes */
 				if (addr->preferred_lt > (uint32_t)now) {
 					preferred_lt = TIME_LEFT(addr->preferred_lt, now);
 
@@ -441,7 +463,7 @@ static void send_router_advert_upstream_change(struct interface *iface, bool ups
 				if (preferred_lt > valid_lt)
 					preferred_lt = valid_lt;
 			} else {
-				/* Upstream is down, set lifetimes to zero */
+				/* Upstream is down for this prefix, set lifetimes to zero */
 				preferred_lt = 0;
 				valid_lt = 0;
 			}
