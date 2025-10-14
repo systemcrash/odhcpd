@@ -732,6 +732,125 @@ static void handle_client_request(void *addr, void *data, size_t len,
 		maxrt.type = htons(DHCPV6_OPT_INF_MAX_RT);
 	}
 
+	if (hdr->msg_type == DHCPV6_MSG_LEASEQUERY) {
+		dest.msg_type = DHCPV6_MSG_LEASEQUERY_REPLY;
+		// https://www.rfc-editor.org/rfc/rfc5007#section-3.3 Query by IPv6 address
+		// https://www.rfc-editor.org/rfc/rfc5007#section-3.3 Query by Client Identifier (DUID)
+
+		/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.1 Query Option (44)
+		   The Query option is used only in a LEASEQUERY message and identifies
+		   the query being performed.  The option includes the query type, link-
+		   address (or 0::0), and option(s) to provide data needed for the
+		   query.
+
+		   The format of the Query option is shown below:
+
+				0                   1                   2                   3
+				0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+			   |        OPTION_LQ_QUERY        |         option-len            |
+			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+			   |   query-type  |                                               |
+			   +-+-+-+-+-+-+-+-+                                               |
+			   |                                                               |
+			   |                         link-address                          |
+			   |                                                               |
+			   |               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+			   |               |                                               .
+			   +-+-+-+-+-+-+-+-+                                               .
+			   .                         query-options                         .
+			   .                                                               .
+			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+			QUERY_BY_ADDRESS (needs OPTION_IAADDR) or QUERY_BY_CLIENTID (needs OPTION_CLIENTID)
+		*/
+
+		/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.2 Client Data Option (45)
+		   The Client Data option is used to encapsulate the data for a single
+		   client on a single link in a LEASEQUERY-REPLY message.
+
+		   The format of the Client Data option is shown below:
+
+				0                   1                   2                   3
+				0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+			   |       OPTION_CLIENT_DATA      |         option-len            |
+			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+			   .                                                               .
+			   .                        client-options                         .
+			   .                                                               .
+			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		*/
+
+		/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.3 Client Last Transaction Time Option (46)
+			The Client Last Transaction Time option is encapsulated in an
+			OPTION_CLIENT_DATA and identifies how long ago the server last
+			communicated with the client, in seconds.
+
+			The format of the Client Last Transaction Time option is shown below:
+
+				 0                   1                   2                   3
+				 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+				|        OPTION_CLT_TIME        |         option-len            |
+				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+				|                 client-last-transaction-time                  |
+				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		*/
+
+		/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.4 Relay Data (47)
+		   The Relay Data option is used only in a LEASEQUERY-REPLY message and
+		   provides the relay agent information used when the client last
+		   communicated with the server.
+
+		   The format of the Relay Data option is shown below:
+
+				0                   1                   2                   3
+				0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+			   |     OPTION_LQ_RELAY_DATA      |         option-len            |
+			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+			   |                                                               |
+			   |                  peer-address (IPv6 address)                  |
+			   |                                                               |
+			   |                                                               |
+			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+			   |                                                               |
+			   |                       DHCP-relay-message                      |
+			   .                                                               .
+			   .                                                               .
+			   .                                                               .
+			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		*/
+
+		/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.5 Client Link Option (48)
+			The Client Link option is used only in a LEASEQUERY-REPLY message and
+			identifies the links on which the client has one or more bindings.
+			It is used in reply to a query when no link-address was specified and
+			the client is found to be on more than one link.
+
+			The format of the Client Link option is shown below:
+
+				 0                   1                   2                   3
+				 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+				|     OPTION_LQ_CLIENT_LINK     |         option-len            |
+				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+				|                                                               |
+				|                  link-address (IPv6 address)                  |
+				|                                                               |
+				|                                                               |
+				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+				|                                                               |
+				|                  link-address (IPv6 address)                  |
+				|                                                               |
+				|                                                               |
+				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+				|                              ...                              |
+				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		*/
+	}
+
 #ifdef DHCPV4_SUPPORT
 	if (hdr->msg_type == DHCPV6_MSG_DHCPV4_QUERY) {
 		struct _packed dhcpv4_msg_data {
