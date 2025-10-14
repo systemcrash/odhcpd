@@ -339,6 +339,8 @@ static void handle_client_request(void *addr, void *data, size_t len,
 	case DHCPV6_MSG_REPLY:			// 7
 	case DHCPV6_MSG_RECONFIGURE:	// 10
 	case DHCPV6_MSG_RELAY_REPL:		// 13
+	case DHCPV6_MSG_LEASEQUERY:		// 14
+	case DHCPV6_MSG_LEASEQUERY_REPLY:// 15
 #ifndef DHCPV4_SUPPORT
 	/* if we omit DHCPV4 support, ignore this client message type */
 	case DHCPV6_MSG_DHCPV4_QUERY:	// 20
@@ -913,6 +915,8 @@ static void relay_client_request(struct sockaddr_in6 *source,
 	case DHCPV6_MSG_REPLY:			// 7
 	case DHCPV6_MSG_RECONFIGURE:	// 10
 	case DHCPV6_MSG_RELAY_REPL:		// 13
+	case DHCPV6_MSG_LEASEQUERY:		// 14
+	case DHCPV6_MSG_LEASEQUERY_REPLY:// 15
 	case DHCPV6_MSG_DHCPV4_RESPONSE:// 21
 		return;
 	default:
