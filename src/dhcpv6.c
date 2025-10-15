@@ -88,14 +88,33 @@ struct lq_client_binding {
  * These traverse struct interface->ia_assignments (list of dhcp_assignment).
  * Return dynamically allocated copies of binding data (caller must free).
  */
-static struct lq_client_binding *find_binding_by_iaaddr(const struct in6_addr *addr6)
+static struct lq_client_binding *find_binding_by_iaaddr(const struct in6_addr *addr6,
+								const struct in6_addr *link_addr6)
 {
 	struct interface *iface;
 	struct dhcp_assignment *a;
 	struct odhcpd_ipaddr *addrs;
+	struct odhcpd_ipaddr *if_addr6s;
 	size_t n;
+	bool link_specific = !IN6_IS_ADDR_UNSPECIFIED(link_addr6);
+	bool found_link = (link_specific == true) ? false : true;
+
+/*	RFC5007 4.4.1
+	If the OPTION_LQ_QUERY specified a non-zero link-address, the server
+	MUST use the link-address to find the appropriate link for the
+	client.  For a QUERY_BY_ADDRESS, if the 0::0 link-address was
+	specified, the server uses the address from the OPTION_IAADDR option
+	to find the appropriate link for the client. */
 
 	avl_for_each_element(&interfaces, iface, avl) {
+		if_addr6s = iface->addr6;
+		if (link_specific) {
+			for (n = 0; n < iface->addr6_len / sizeof(*if_addr6s); n++) {
+				if (IN6_ARE_ADDR_EQUAL(&if_addr6s[n].addr.in6, link_addr6))
+					found_link = true;
+			}
+		}
+
 		list_for_each_entry(a, &iface->ia_assignments, head) {
 			addrs = a->managed;
 			size_t addrs_cnt = a->managed_size / sizeof(*addrs);
@@ -110,7 +129,7 @@ static struct lq_client_binding *find_binding_by_iaaddr(const struct in6_addr *a
 				return NULL;
 
 			for (n = 0; n < addrs_cnt / sizeof(*addrs); n++) {
-				if (IN6_ARE_ADDR_EQUAL(&addrs[n].addr.in6, addr6)) {
+				if (IN6_ARE_ADDR_EQUAL(&addrs[n].addr.in6, addr6) && found_link) {
 					struct lq_client_binding *b = calloc(1, sizeof(*b));
 					if (!b)
 						return NULL;
@@ -156,14 +175,35 @@ static struct lq_client_binding *find_binding_by_iaaddr(const struct in6_addr *a
 	return NULL;
 }
 
-static struct lq_client_binding *find_binding_by_duid(const uint8_t *duid, size_t duid_len)
+static struct lq_client_binding *find_binding_by_duid(const uint8_t *duid, size_t duid_len,
+								const struct in6_addr *link_addr6)
 {
 	struct interface *iface;
 	struct dhcp_assignment *a;
 	struct odhcpd_ipaddr *addrs;
+	// struct odhcpd_ipaddr *if_addr6s;
 	size_t n;
+	// bool link_specific = !IN6_IS_ADDR_UNSPECIFIED(link_addr6);
+	// bool found_link = (link_specific == true) ? false : true;
+
+/*	RFC5007 4.4.1
+	For a QUERY_BY_CLIENTID, if a 0::0 link-address was specified, the
+	server MUST search all of its links for the client.  If the client is
+	only found on a single link, the server SHOULD return that client's
+	data in an OPTION_CLIENT_DATA option.  If the client is found on more
+	than a single link, the server MUST return the list of links in the
+	OPTION_LQ_CLIENT_LINK option; the server MUST NOT return any client
+	data. */
 
 	avl_for_each_element(&interfaces, iface, avl) {
+		// if_addr6s = iface->addr6;
+		// if (link_specific) {
+		// 	for (n = 0; n < iface->addr6_len / sizeof(*if_addr6s); n++) {
+		// 		if (IN6_ARE_ADDR_EQUAL(&if_addr6s[n].addr.in6, link_addr6))
+		// 			found_link = true;
+		// 	}
+		// }
+
 		list_for_each_entry(a, &iface->ia_assignments, head) {
 			addrs = a->managed;
 			size_t addrs_cnt = a->managed_size / sizeof(*addrs);
@@ -1331,6 +1371,13 @@ static void handle_client_request(void *addr, void *data, size_t len,
 					"QUERY_BY_CLIENTID but missing OPTION_CLIENTID");
 		}
 
+		/*	RFC5007 4.4.1:
+			A server may also restrict LEASEQUERY messages, or query-types, to
+			certain requestors.  In this case, the server MAY discard the
+			LEASEQUERY message or MAY add an OPTION_STATUS_CODE option with the
+			NotAllowed status code and send the LEASEQUERY-REPLY to the
+			requestor. */
+
 		/* If an error was detected in the included client options,
 			append a Status Code option to the reply */
 		if (status_code) {
@@ -1363,9 +1410,9 @@ static void handle_client_request(void *addr, void *data, size_t len,
 		struct lq_client_binding *binding = NULL;
 
 		if (have_iaaddr) {
-			binding = find_binding_by_iaaddr(&query_addr);
+			binding = find_binding_by_iaaddr(&query_addr, &link_address);
 		} else if (have_clientid) {
-			binding = find_binding_by_duid(found_clientid_ptr, found_clientid_len);
+			binding = find_binding_by_duid(found_clientid_ptr, found_clientid_len, &link_address);
 		} else {
 			/* Query without IAADDR or CLIENTID: RFC5007 supports other behaviors
 			 * (e.g. query the database for clients on link), but here we ignore. */
