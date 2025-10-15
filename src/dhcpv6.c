@@ -685,6 +685,7 @@ enum {
 	IOV_DHCPV4O6_SERVER,
 	IOV_DNR,
 	IOV_BOOTFILE_URL,
+	IOV_OPT_STATUS,
 	IOV_TOTAL
 };
 
@@ -1071,6 +1072,13 @@ static void handle_client_request(void *addr, void *data, size_t len,
 		.addr = iface->dhcpv6_pd_cer,
 	};
 
+	struct dhcpv6_opt_status {
+		uint16_t code;   /* OPTION_STATUS_CODE = 13 */
+		uint16_t len;    /* payload length */
+		uint16_t status; /* status code (e.g. 6 = UnknownQueryType) */
+		/* followed by optional UTF-8 message text */
+	} __attribute__((packed));
+
 
 	uint8_t pdbuf[512];
 	struct iovec iov[IOV_TOTAL] = {
@@ -1274,6 +1282,9 @@ static void handle_client_request(void *addr, void *data, size_t len,
 		uint8_t *found_clientid_ptr = NULL;
 		uint16_t found_clientid_len = 0;
 
+		uint16_t status_code = 0;
+		char status_msg[64] = {0};
+
 		while (qopt + 4 <= query_opts_end) {
 			uint16_t q_otype = ntohs(*(uint16_t *)qopt);
 			uint16_t q_olen  = ntohs(*(uint16_t *)(qopt + 2));
@@ -1287,6 +1298,11 @@ static void handle_client_request(void *addr, void *data, size_t len,
 				if (q_olen >= 16) {
 					memcpy(&query_addr, q_odata, 16);
 					have_iaaddr = true;
+				} else {
+					status_code = DHCPV6_STATUS_MALFORMED_QUERY; /* 8 */
+					snprintf(status_msg, sizeof(status_msg),
+							"QUERY_BY_ADDRESS missing IPv6 link-address");
+					break;
 				}
 			} else if (qtype == DHCPV6_QUERY_BY_CLIENTID && q_otype == DHCPV6_OPT_CLIENTID) {
 				/* record the clientid pointer+len for later lookup */
@@ -1294,8 +1310,54 @@ static void handle_client_request(void *addr, void *data, size_t len,
 				found_clientid_ptr = q_odata;
 				found_clientid_len = q_olen;
 				have_clientid = true;
+			} else {
+				/* Unsupported query type */
+				status_code = DHCPV6_STATUS_UNKNOWN_QUERY_TYPE; /* 7 */
+				snprintf(status_msg, sizeof(status_msg),
+						"Unsupported query-type %u", q_otype);
+				break;
 			}
 			qopt = q_odata + q_olen;
+		}
+
+		if (qtype == DHCPV6_QUERY_BY_ADDRESS && !have_iaaddr) {
+			status_code = DHCPV6_STATUS_MALFORMED_QUERY; /* 8 */
+			snprintf(status_msg, sizeof(status_msg),
+					"QUERY_BY_ADDRESS but missing OPTION_IAADDR");
+		}
+		else if (qtype == DHCPV6_QUERY_BY_CLIENTID && !have_clientid) {
+			status_code = DHCPV6_STATUS_MALFORMED_QUERY; /* 8 */
+			snprintf(status_msg, sizeof(status_msg),
+					"QUERY_BY_CLIENTID but missing OPTION_CLIENTID");
+		}
+
+		/* If an error was detected in the included client options,
+			append a Status Code option to the reply */
+		if (status_code) {
+			struct {
+				struct dhcpv6_opt_status hdr;
+				char msg[64];
+			} __attribute__((packed)) st_opt = {
+				.hdr = {
+					.code = htons(DHCPV6_OPT_STATUS), /* 13 */
+					.len  = htons(sizeof(uint16_t) + strlen(status_msg)),
+					.status = htons(status_code),
+				},
+			};
+
+			memcpy(st_opt.msg, status_msg, strlen(status_msg));
+
+			struct iovec iov_status = {
+				.iov_base = &st_opt,
+				.iov_len  = 4 + ntohs(st_opt.hdr.len),
+			};
+
+			/* Append to existing iovec array */
+			iov[IOV_OPT_STATUS] = iov_status;
+
+			/* Now send a minimal LQ-Reply containing this status */
+			odhcpd_send(iface->dhcpv6_event.uloop.fd, addr, iov, ARRAY_SIZE(iov), iface);
+			return;
 		}
 
 		struct lq_client_binding *binding = NULL;
@@ -1311,10 +1373,34 @@ static void handle_client_request(void *addr, void *data, size_t len,
 		}
 
 		if (!binding) {
-			/* No such client — per RFC5007 we send a LEASEQUERY-REPLY with no OPTION_CLIENT_DATA
-			 * (but we still may include OPTION_CLIENT_LINK if we found multiple links). We'll
-			 * just send an empty reply (stateless). */
-			iov[IOV_PDBUF].iov_len = 0;
+			/* No such client */
+			// iov[IOV_PDBUF].iov_len = 0;
+
+			status_code = DHCPV6_STATUS_NOT_CONFIGURED; /* 9 */
+			snprintf(status_msg, sizeof(status_msg),
+					"Server hasn't the target address or link in its configuration");
+
+			struct {
+				struct dhcpv6_opt_status hdr;
+				char msg[64];
+			} __attribute__((packed)) st_opt = {
+				.hdr = {
+					.code = htons(DHCPV6_OPT_STATUS), /* 13 */
+					.len  = htons(sizeof(uint16_t) + strlen(status_msg)),
+					.status = htons(status_code),
+				},
+			};
+
+			memcpy(st_opt.msg, status_msg, strlen(status_msg));
+
+			struct iovec iov_status = {
+				.iov_base = &st_opt,
+				.iov_len  = 4 + ntohs(st_opt.hdr.len),
+			};
+
+			/* Append to existing iovec array */
+			iov[IOV_OPT_STATUS] = iov_status;
+
 			odhcpd_send(iface->dhcpv6_event.uloop.fd, addr, iov, ARRAY_SIZE(iov), iface);
 			return;
 		}
