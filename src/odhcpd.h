@@ -248,6 +248,12 @@ struct dhcp_assignment {
 	ssize_t managed_size;
 	struct ustream_fd managed_sock;
 
+	// RFC5007 - store a copy of the last relayed msg from server
+	struct dhcpv6_option_relay_data *relay_msg;
+	size_t relay_msg_len;
+	// RFC5007 - clients last transaction time
+	uint32_t clt_time;
+
 	unsigned int flags;
 	uint32_t leasetime;
 	char *hostname;
