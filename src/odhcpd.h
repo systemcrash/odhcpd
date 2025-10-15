@@ -275,6 +275,12 @@ struct dhcpv6_lease {
 	uint32_t iaid;
 	uint8_t length; // length == 128 -> IA_NA, length <= 64 -> IA_PD
 
+	// RFC5007 - store a copy of the last relayed msg from server
+	struct dhcpv6_option_relay_data *relay_msg;
+	size_t relay_msg_len;
+	// RFC5007 - clients last transaction time
+	uint32_t clt_time;
+
 	unsigned int flags;
 	uint32_t leasetime;
 	char *hostname;

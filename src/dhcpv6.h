@@ -182,6 +182,53 @@ struct dhcpv6_cer_id {
 	struct in6_addr addr;
 };
 
+/* RFC 3315 - OPTION_CLIENTID (1)
+ * Variable-length opaque data blob.
+ */
+struct dhcpv6_option_client_id {
+	uint16_t type;			/* = htons(1) */
+	uint16_t len;			/* length of data[] */
+	uint8_t  data[];		/* opaque payload */
+} __attribute__((packed));
+
+/* RFC 5007 - OPTION_CLIENT_DATA (45)
+ * Variable-length opaque data blob.
+ */
+struct dhcpv6_option_client_data {
+	uint16_t type;			/* = htons(45) */
+	uint16_t len;			/* length of data[] */
+	uint8_t  data[];		/* opaque payload */
+} __attribute__((packed));
+
+/* RFC 5007 - OPTION_CLT_TIME (46)
+ * Contains a 32-bit timestamp (seconds since epoch).
+ */
+struct dhcpv6_option_client_time {
+	uint16_t type;			/* = htons(46) */
+	uint16_t len;			/* should be htons(4) */
+	uint32_t clt_time;		/* seconds since epoch */
+} __attribute__((packed));
+
+/* RFC 5007 - OPTION_LQ_RELAY_DATA (47)
+ * Contains a DHCP-relay-message.
+ */
+struct dhcpv6_option_relay_data {
+	uint16_t type;			/* = htons(47) */
+	uint16_t len;			/* should be htons(4) */
+	struct in6_addr peer_addr; /* peer IPv6 */
+	uint8_t  data[];		/* opaque payload */
+} __attribute__((packed));
+
+/* RFC 5007 - OPTION_LQ_CLIENT_LINK (48)
+ * Contains one or more IPv6 addresses.
+ */
+struct dhcpv6_option_client_link {
+	uint16_t type;			/* = htons(48) */
+	uint16_t len;			/* = count * sizeof(struct in6_addr) */
+	struct in6_addr addrs[];/* link-address list */
+} __attribute__((packed));
+
+
 #define dhcpv6_for_each_option(start, end, otype, olen, odata)\
 	for (uint8_t *_o = (uint8_t*)(start); _o + 4 <= (end) &&\
 		((otype) = _o[0] << 8 | _o[1]) && ((odata) = (void*)&_o[4]) &&\

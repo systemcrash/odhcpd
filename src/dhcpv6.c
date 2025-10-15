@@ -39,6 +39,506 @@ static void handle_dhcpv6(void *addr, void *data, size_t len,
 static void handle_client_request(void *addr, void *data, size_t len,
 		struct interface *iface, void *dest_addr);
 
+/* Lightweight client binding structure compatible with odhcpd's dhcpv6-ia.c.
+ * Mirrors the runtime lease/binding state derived from struct dhcp_assignment.
+ */
+struct lq_client_binding {
+	/* DUID and its length if present */
+	/* Client DUID (dhcp_assignment.clid_data / clid_len) */
+	const uint8_t *duid;
+	size_t duid_len;
+
+	/* IAID for this binding (dhcp_assignment.iaid) */
+	uint32_t iaid;
+
+	// /* Lease lifetimes (preferred and valid) */
+	// uint32_t preferred_lifetime;
+	// uint32_t valid_lifetime;
+
+	/* client last transaction time (seconds since epoch) if known */
+	uint32_t clt_time;
+
+	/* IAADDR(s) and lengths (one or more addresses may apply) */
+	/* Addresses or delegated prefixes (dhcp_assignment.managed) */
+	struct in6_addr *addrs6;
+	size_t addrs6_cnt;
+
+	/* Client options (not stored persistently; only if OPTION_CLIENT_DATA present) */
+	const uint8_t *client_options;
+	size_t client_options_len;
+
+	/* Peer (client) address (dhcp_assignment.peer.sin6_addr) */
+	struct in6_addr peer_address;
+
+	/* If server kept a relay message and peer-address, provide them */
+	/* Relay message, if we cached the original Relay-Forward */
+	const struct dhcpv6_option_relay_data *relay_msg; /* raw DHCPv6 relay message bytes */
+	size_t relay_msg_len;
+
+	/* Links where this client has bindings or can be found (used for OPTION_LQ_CLIENT_LINK) */
+	struct in6_addr *link_addresses;
+	size_t link_addresses_cnt;
+
+	/* Link (interface) on which this binding is valid */
+	const char *ifname;
+};
+
+/* -------------------------------------------------------------------------- */
+/* Look-up helpers reflecting odhcpd's binding database (iface->ia_assignments)
+ * These traverse struct interface->ia_assignments (list of dhcp_assignment).
+ * Return dynamically allocated copies of binding data (caller must free).
+ */
+static struct lq_client_binding *find_binding_by_iaaddr(const struct in6_addr *addr6)
+{
+	struct interface *iface;
+	struct dhcp_assignment *a;
+	struct odhcpd_ipaddr *addrs;
+	size_t n;
+
+	avl_for_each_element(&interfaces, iface, avl) {
+		list_for_each_entry(a, &iface->ia_assignments, head) {
+			addrs = a->managed;
+			size_t addrs_cnt = a->managed_size / sizeof(*addrs);
+			size_t valid_addrs_cnt = addrs_cnt;
+
+			for (n = 0; n < addrs_cnt / sizeof(*addrs); n++) {
+				if (addrs[n].valid_lt == 0)
+					valid_addrs_cnt -= 1;
+			}
+
+			if (valid_addrs_cnt == 0)
+				return NULL;
+
+			for (n = 0; n < addrs_cnt / sizeof(*addrs); n++) {
+				if (IN6_ARE_ADDR_EQUAL(&addrs[n].addr.in6, addr6)) {
+					struct lq_client_binding *b = calloc(1, sizeof(*b));
+					if (!b)
+						return NULL;
+
+					b->duid = a->clid_data;
+					b->duid_len = a->clid_len;
+					b->iaid = a->iaid;
+					b->clt_time = a->clt_time;
+					/* Addresses from assignment */
+					b->addrs6 = calloc(valid_addrs_cnt, sizeof(struct in6_addr));
+					if (!b->addrs6) {
+						free(b);
+						return NULL;
+					}
+					for (size_t i = 0; i < addrs_cnt; i++)
+						if (addrs[i].valid_lt != 0)
+							b->addrs6[i] = addrs[i].addr.in6;
+					b->addrs6_cnt = addrs_cnt;
+					b->peer_address = a->peer.sin6_addr;
+					b->relay_msg = a->relay_msg;
+					b->relay_msg_len = a->relay_msg_len;
+					/* --- Properly handle iface->addr6 array --- */
+					size_t link_cnt = iface->addr6_len / sizeof(struct odhcpd_ipaddr);
+					b->link_addresses_cnt = link_cnt;
+
+					if (link_cnt > 0 && iface->addr6) {
+						b->link_addresses = calloc(link_cnt, sizeof(struct in6_addr));
+						if (!b->link_addresses) {
+							free(b->addrs6);
+							free(b);
+							return NULL;
+						}
+
+						for (size_t j = 0; j < link_cnt; j++)
+							b->link_addresses[j] = iface->addr6[j].addr.in6;
+					}
+					b->ifname = iface->ifname;
+					return b;
+				}
+			}
+		}
+	}
+	return NULL;
+}
+
+static struct lq_client_binding *find_binding_by_duid(const uint8_t *duid, size_t duid_len)
+{
+	struct interface *iface;
+	struct dhcp_assignment *a;
+	struct odhcpd_ipaddr *addrs;
+	size_t n;
+
+	avl_for_each_element(&interfaces, iface, avl) {
+		list_for_each_entry(a, &iface->ia_assignments, head) {
+			addrs = a->managed;
+			size_t addrs_cnt = a->managed_size / sizeof(*addrs);
+			size_t valid_addrs_cnt = addrs_cnt;
+
+			for (n = 0; n < addrs_cnt / sizeof(*addrs); n++) {
+				if (addrs[n].valid_lt == 0)
+					valid_addrs_cnt -= 1;
+			}
+
+			if (valid_addrs_cnt == 0)
+				return NULL;
+
+			if (a->clid_len == duid_len &&
+				!memcmp(a->clid_data, duid, duid_len)) {
+				struct lq_client_binding *b = calloc(1, sizeof(*b));
+				if (!b)
+					return NULL;
+
+				b->duid = a->clid_data;
+				b->duid_len = a->clid_len;
+				b->iaid = a->iaid;
+				b->clt_time = a->clt_time;
+				/* Addresses from assignment */
+				b->addrs6 = calloc(valid_addrs_cnt, sizeof(struct in6_addr));
+				if (!b->addrs6) {
+					free(b);
+					return NULL;
+				}
+				for (size_t i = 0; i < addrs_cnt; i++)
+					if (addrs[i].valid_lt != 0)
+						b->addrs6[i] = addrs[i].addr.in6;
+				b->addrs6_cnt = addrs_cnt;
+				b->peer_address = a->peer.sin6_addr;
+				b->relay_msg = a->relay_msg;
+				b->relay_msg_len = a->relay_msg_len;
+				/* --- Properly handle iface->addr6 array --- */
+				size_t link_cnt = iface->addr6_len / sizeof(struct odhcpd_ipaddr);
+				b->link_addresses_cnt = link_cnt;
+
+				if (link_cnt > 0 && iface->addr6) {
+					b->link_addresses = calloc(link_cnt, sizeof(struct in6_addr));
+					if (!b->link_addresses) {
+						free(b->addrs6);
+						free(b);
+						return NULL;
+					}
+
+					for (size_t j = 0; j < link_cnt; j++)
+						b->link_addresses[j] = iface->addr6[j].addr.in6;
+				}
+				b->ifname = iface->ifname;
+				return b;
+			}
+		}
+	}
+	return NULL;
+}
+
+/* Safely free a dynamically allocated lq_client_binding.
+ * Only frees what was explicitly allocated by the caller or find_binding_*().
+ */
+static void free_lq_client_binding(struct lq_client_binding *b)
+{
+	if (!b)
+		return;
+
+	/* In our current design:
+	 *  - b->addrs points into odhcpd's internal assignment, do NOT free.
+	 *  - b->duid points into odhcpd memory, do NOT free.
+	 *  - b->client_options or relay_msg MAY be allocated copies, so free safely.
+	 */
+	free((void *)b->client_options);
+	free((void *)b->relay_msg);
+    free(b->addrs6);
+
+	free(b);
+}
+
+// /* Build OPTION_CLIENT_DATA (45): opaque client data (from OPTION_CLIENT_DATA) */
+// static ssize_t append_client_data(uint8_t *buf, size_t buf_len,
+// 								  const struct lq_client_binding *b)
+// {
+// 	// strategy: invoke:
+// 	// - append_client_time (and its length is known)
+// 	// - append_client_id (and its length is known)
+// 	// - append_lq_relay_data (and its length is known)
+// 	// - append_client_link (and its length is known)
+// 	// sum the lengths, and form the header.
+// 	// return
+
+
+// 	if (!b || !b->client_options || b->client_options_len == 0)
+// 		return 0;
+
+// 	size_t payload_len = b->client_options_len;
+// 	size_t total_len   = sizeof(struct dhcpv6_option_client_data) + payload_len;
+
+// 	if (buf_len < total_len)
+// 		return -1;
+
+// 	struct dhcpv6_option_client_data *opt = (struct dhcpv6_option_client_data *)buf;
+
+// 	opt->type = htons(DHCPV6_OPTION_CLIENT_DATA);
+// 	opt->len  = htons(payload_len);
+
+// 	memcpy(opt->data, b->client_options, payload_len);
+
+// 	return total_len;
+// }
+
+
+/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.3 Client Last Transaction Time Option (46)
+	The Client Last Transaction Time option is encapsulated in an
+	OPTION_CLIENT_DATA and identifies how long ago the server last
+	communicated with the client, in seconds.
+
+	The format of the Client Last Transaction Time option is shown below:
+
+		 0                   1                   2                   3
+		 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|        OPTION_CLT_TIME        |         option-len            |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                 client-last-transaction-time                  |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+*/
+/* Build OPTION_CLT_TIME (46): client's last transaction time */
+static ssize_t append_client_time(uint8_t *buf, size_t buf_len,
+								  const struct lq_client_binding *b)
+{
+	if (!b)
+		return 0;
+
+	size_t total_len = sizeof(struct dhcpv6_option_client_time);
+
+	if (buf_len < total_len)
+		return -1;
+
+	struct dhcpv6_option_client_time *opt = (struct dhcpv6_option_client_time *)buf;
+
+	opt->type		= htons(DHCPV6_OPTION_CLT_TIME);
+	opt->len		= htons(sizeof(opt->clt_time));
+	opt->clt_time	= htonl(b->clt_time);
+
+	return total_len;
+}
+
+
+/* Append OPTION_CLIENTID (1)
+ * into a contiguous DHCPv6 option block.
+ *
+ * Returns total bytes written, or -1 on error.
+ */
+static ssize_t append_client_id(uint8_t *buf, size_t buf_len,
+									 const struct lq_client_binding *b)
+{
+	if (!b || b->duid_len == 0)
+		return 0;
+
+	size_t payload_len = b->duid_len;
+	size_t total_len   = sizeof(struct dhcpv6_option_client_id) + payload_len;
+
+	if (buf_len < total_len)
+		return -1;
+
+	struct dhcpv6_option_client_id *opt = (struct dhcpv6_option_client_id *)buf;
+
+	opt->type = htons(DHCPV6_OPT_CLIENTID);
+	opt->len  = htons(payload_len);
+
+	memcpy(opt->data, b->duid, payload_len);
+
+	return total_len;
+
+}
+
+/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.4 Relay Data (47)
+   The Relay Data option is used only in a LEASEQUERY-REPLY message and
+   provides the relay agent information used when the client last
+   communicated with the server.
+
+   The format of the Relay Data option is shown below:
+
+		0                   1                   2                   3
+		0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	   |     OPTION_LQ_RELAY_DATA      |         option-len            |
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	   |                                                               |
+	   |                  peer-address (IPv6 address)                  |
+	   |                                                               |
+	   |                                                               |
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	   |                                                               |
+	   |                       DHCP-relay-message                      |
+	   .                                                               .
+	   .                                                               .
+	   .                                                               .
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+*/
+/* Build LQ_RELAY_DATA option (47). Format per RFC5007:
+ * | option (2) | len (2) | peer-address (16) | DHCP-relay-message (variable) |
+
+   If returned, the DHCP-relay-message MUST contain a valid (perhaps
+   multi-hop) RELAY-FORW message as the most recently received by the
+   server for the client.  However, the (innermost) OPTION_RELAY_MSG
+   option containing the client's message MUST have been removed.
+   This option SHOULD only be returned if requested by the OPTION_ORO of
+   the OPTION_LQ_QUERY.
+ */
+static ssize_t append_lq_relay_data(uint8_t *buf, size_t buf_len,
+									const struct lq_client_binding *b)
+{
+	if (!b || !b->relay_msg || b->relay_msg_len == 0)
+		return 0;
+
+	size_t payload_len = b->relay_msg_len;
+	size_t total_len   = sizeof(struct dhcpv6_option_relay_data) + payload_len;
+
+	if (buf_len < total_len)
+		return -1;
+
+	struct dhcpv6_option_relay_data *opt = (struct dhcpv6_option_relay_data *)buf;
+
+	// TODO: remove the OPTION_RELAY_MSG option
+
+	opt->type = htons(DHCPV6_OPTION_LQ_RELAY_DATA);
+	opt->len  = htons(payload_len);
+
+	memcpy(opt->data, b->relay_msg, payload_len);
+
+	return total_len;
+}
+
+/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.5 Client Link Option (48)
+	The Client Link option is used only in a LEASEQUERY-REPLY message and
+	identifies the links on which the client has one or more bindings.
+	It is used in reply to a query when no link-address was specified and
+	the client is found to be on more than one link.
+
+	The format of the Client Link option is shown below:
+
+		 0                   1                   2                   3
+		 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|     OPTION_LQ_CLIENT_LINK     |         option-len            |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                                                               |
+		|                  link-address (IPv6 address)                  |
+		|                                                               |
+		|                                                               |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                                                               |
+		|                  link-address (IPv6 address)                  |
+		|                                                               |
+		|                                                               |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                              ...                              |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+*/
+/* Build OPTION_LQ_CLIENT_LINK (48): list of IPv6 addresses */
+static ssize_t append_client_link(uint8_t *buf, size_t buf_len,
+								  const struct lq_client_binding *b)
+{
+	if (!b || b->link_addresses_cnt == 0 || !b->link_addresses)
+		return 0;
+
+	// size_t opt_len = 4 + 16 * b->link_addresses_cnt;
+	// if (opt_len > buf_len)
+	// 	return -1;
+
+	size_t payload_len = b->link_addresses_cnt * sizeof(struct in6_addr);
+	size_t total_len   = sizeof(struct dhcpv6_option_client_link) + payload_len;
+
+	if (buf_len < total_len)
+		return -1;
+
+	struct dhcpv6_option_client_link *opt = (struct dhcpv6_option_client_link *)buf;
+
+	opt->type = htons(DHCPV6_OPTION_LQ_CLIENT_LINK);
+	opt->len  = htons(payload_len);
+
+	memcpy(opt->addrs, b->link_addresses, payload_len);
+
+	return total_len;
+}
+
+/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.2 Client Data Option (45)
+   The Client Data option is used to encapsulate the data for a single
+   client on a single link in a LEASEQUERY-REPLY message.
+
+   The format of the Client Data option is shown below:
+
+		0                   1                   2                   3
+		0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	   |       OPTION_CLIENT_DATA      |         option-len            |
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	   .                                                               .
+	   .                        client-options                         .
+	   .                                                               .
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+*/
+/* Append
+ * OPTION_CLIENTID (1)
+ * OPTION_CLIENT_DATA (45)
+ * OPTION_CLT_TIME (46)
+ * OPTION_LQ_RELAY_DATA (47)
+ * OPTION_LQ_CLIENT_LINK (48)
+ * into a contiguous DHCPv6 option block.
+ *
+ * Returns total bytes written, or -1 on error.
+ */
+static ssize_t append_client_options(uint8_t *buf, size_t buf_len,
+									 const struct lq_client_binding *b)
+{
+/*	An OPTION_CLIENT_DATA option in a LEASEQUERY-REPLY message MUST
+	minimally contain the following options:
+	1.  OPTION_CLIENTID
+	2.  OPTION_IAADDR and/or OPTION_IAPREFIX
+	3.  OPTION_CLT_TIME */
+
+	uint8_t *p = buf;
+	size_t remaining = buf_len;
+	//size_t opts_len = 0;
+	ssize_t len;
+
+	/* OPTION_CLIENT_DATA - 45 */
+	uint16_t opt_client_data = htons(DHCPV6_OPTION_CLIENT_DATA);
+	memcpy(p, &opt_client_data, 2);
+    p += 2;
+    uint8_t *len_field = p; /* 2 bytes to fill later */
+    p += 2;
+
+	/* OPTION_CLIENTID - 1 */
+	len = append_client_id(p, remaining, b);
+	if (len < 0)
+		return -1;
+	p += len;
+	// opts_len += len;
+	remaining -= len;
+
+	/* OPTION_CLT_TIME - 46 */
+	len = append_client_time(p, remaining, b);
+	if (len < 0)
+		return -1;
+	p += len;
+	// opts_len += len;
+	remaining -= len;
+
+	/* OPTION_CLIENTID - 47 */
+	len = append_lq_relay_data(p, remaining, b);
+	if (len < 0)
+		return -1;
+	p += len;
+	// opts_len += len;
+	remaining -= len;
+
+	/* OPTION_LQ_CLIENT_LINK - 48 */
+	len = append_client_link(p, remaining, b);
+	if (len < 0)
+		return -1;
+	p += len;
+	// opts_len += len;
+	remaining -= len;
+
+	// store the OPTION_CLIENT_DATA length field
+    uint16_t client_data_len = htons((uint16_t)(p - (len_field + 2)));
+    memcpy(len_field, &client_data_len, 2);
+	// len_field = htons(opts_len);
+
+	return p - buf;
+}
+
 
 /* Create socket and register events */
 int dhcpv6_init(void)
@@ -342,6 +842,7 @@ static void handle_client_request(void *addr, void *data, size_t len,
 	case DHCPV6_MSG_DECLINE:
 	case DHCPV6_MSG_INFORMATION_REQUEST:
 	case DHCPV6_MSG_RELAY_FORW:
+	case DHCPV6_MSG_LEASEQUERY:
 #ifdef DHCPV4_SUPPORT
 	/* if we include DHCPV4 support, handle this message type */
 	case DHCPV6_MSG_DHCPV4_QUERY:
@@ -352,6 +853,7 @@ static void handle_client_request(void *addr, void *data, size_t len,
 	case DHCPV6_MSG_REPLY:
 	case DHCPV6_MSG_RECONFIGURE:
 	case DHCPV6_MSG_RELAY_REPL:
+	case DHCPV6_MSG_LEASEQUERY_REPLY:
 #ifndef DHCPV4_SUPPORT
 	/* if we omit DHCPV4 support, ignore this client message type */
 	case DHCPV6_MSG_DHCPV4_QUERY:
@@ -649,8 +1151,16 @@ static void handle_client_request(void *addr, void *data, size_t len,
 		[IOV_BOOTFILE_URL] = {NULL, 0}
 	};
 
-	if (hdr->msg_type == DHCPV6_MSG_RELAY_FORW)
+	if (hdr->msg_type == DHCPV6_MSG_RELAY_FORW) {
+		// TODO: store the RELAY-FORW for later (RFC5007) without the OPTION_RELAY_MSG
+
+		// If returned, the DHCP-relay-message MUST contain a valid (perhaps
+		// multi-hop) RELAY-FORW message as the most recently received by the
+		// server for the client.  However, the (innermost) OPTION_RELAY_MSG
+		// option containing the client's message MUST have been removed.
+
 		handle_nested_message(data, len, &hdr, &opts, &opts_end, iov);
+	}
 
 	if (!IN6_IS_ADDR_MULTICAST((struct in6_addr *)dest_addr) && iov[IOV_NESTED].iov_len == 0 &&
 	    (hdr->msg_type == DHCPV6_MSG_SOLICIT || hdr->msg_type == DHCPV6_MSG_CONFIRM ||
@@ -764,91 +1274,113 @@ static void handle_client_request(void *addr, void *data, size_t len,
 
 			QUERY_BY_ADDRESS (needs OPTION_IAADDR) or QUERY_BY_CLIENTID (needs OPTION_CLIENTID)
 		*/
+		/* Find the LQ Query option (44) in the incoming message */
+		uint16_t qtype = 0;
+		struct in6_addr link_address;
+		bool have_query = false;
+		uint8_t *query_opts = NULL;
+		uint8_t *query_opts_end = NULL;
 
-		/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.2 Client Data Option (45)
-		   The Client Data option is used to encapsulate the data for a single
-		   client on a single link in a LEASEQUERY-REPLY message.
+		dhcpv6_for_each_option(opts, opts_end, otype, olen, odata) {
+			if (otype == DHCPV6_OPTION_LQ_QUERY && olen >= 1 + 16) {
+				have_query = true;
+				qtype = odata[0]; /* one octet query-type per RFC5007 */
+				/* link-address starts at odata[1] (16 bytes) */
+				memcpy(&link_address, &odata[1], 16);
+				/* query-options start after that */
+				query_opts = &odata[1 + 16];
+				query_opts_end = query_opts + (olen - (1 + 16));
+				break;
+			}
+		}
 
-		   The format of the Client Data option is shown below:
+		if (!have_query) {
+			/* No Query option -> per RFC we may ignore or send empty reply; we ignore */
+			return;
+		}
 
-				0                   1                   2                   3
-				0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			   |       OPTION_CLIENT_DATA      |         option-len            |
-			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			   .                                                               .
-			   .                        client-options                         .
-			   .                                                               .
-			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		/* Determine whether the nested query-options contain OPTION_IAADDR or OPTION_CLIENTID */
+		uint8_t *qopt = query_opts;
+		// uint16_t found_clientid = 0;
+		struct in6_addr query_addr;
+		bool have_iaaddr = false, have_clientid = false;
+		uint8_t *found_clientid_ptr = NULL;
+		uint16_t found_clientid_len = 0;
+
+		while (qopt + 4 <= query_opts_end) {
+			uint16_t q_otype = ntohs(*(uint16_t *)qopt);
+			uint16_t q_olen  = ntohs(*(uint16_t *)(qopt + 2));
+			uint8_t *q_odata = qopt + 4;
+			if (qopt + 4 + q_olen > query_opts_end)
+				break;
+
+			if (qtype == DHCPV6_QUERY_BY_ADDRESS && q_otype == DHCPV6_OPT_IA_ADDR) {
+				/* IA_ADDR carries an IPv6 address inside its payload; extract IPv6
+				 * RFC8415 IAADDR body: addr(16) + preferred(4) + valid(4) + ... */
+				if (q_olen >= 16) {
+					memcpy(&query_addr, q_odata, 16);
+					have_iaaddr = true;
+				}
+			} else if (qtype == DHCPV6_QUERY_BY_CLIENTID && q_otype == DHCPV6_OPT_CLIENTID) {
+				/* record the clientid pointer+len for later lookup */
+				// found_clientid = q_otype;
+				found_clientid_ptr = q_odata;
+				found_clientid_len = q_olen;
+				have_clientid = true;
+			}
+			qopt = q_odata + q_olen;
+		}
+
+		struct lq_client_binding *binding = NULL;
+
+		if (have_iaaddr) {
+			binding = find_binding_by_iaaddr(&query_addr);
+		} else if (have_clientid) {
+			binding = find_binding_by_duid(found_clientid_ptr, found_clientid_len);
+		} else {
+			/* Query without IAADDR or CLIENTID: RFC5007 supports other behaviors
+			 * (e.g. query the database for clients on link), but here we ignore. */
+			return;
+		}
+
+		if (!binding) {
+			/* No such client — per RFC5007 we send a LEASEQUERY-REPLY with no OPTION_CLIENT_DATA
+			 * (but we still may include OPTION_CLIENT_LINK if we found multiple links). We'll
+			 * just send an empty reply (stateless). */
+			iov[IOV_PDBUF].iov_len = 0;
+			odhcpd_send(iface->dhcpv6_event.uloop.fd, addr, iov, ARRAY_SIZE(iov), iface);
+			return;
+		}
+
+		/* Build OPTION_CLIENT_DATA (+ nested client-options such as CLT_TIME) in pdbuf */
+		memset(pdbuf, 0, sizeof(pdbuf));
+		ssize_t built = append_client_options(pdbuf, sizeof(pdbuf), binding);
+		if (built < 0) {
+			syslog(LOG_ERR, "LEASEQUERY: client data too large");
+			goto free_binding;
+		}
+
+		size_t total = built;
+
+		/* Build OPTION_XXX in pdbuf 
+		ssize_t xxx = append_xxx(pdbuf + total, sizeof(pdbuf) - total, binding);
+		if (xxx < 0) {
+			syslog(LOG_ERR, "LEASEQUERY: client data too large");
+			goto free_binding;
+		}
+
+		total += (xxx > 0) ? xxx : 0;
 		*/
 
-		/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.3 Client Last Transaction Time Option (46)
-			The Client Last Transaction Time option is encapsulated in an
-			OPTION_CLIENT_DATA and identifies how long ago the server last
-			communicated with the client, in seconds.
+		iov[IOV_PDBUF].iov_base = pdbuf;
+		iov[IOV_PDBUF].iov_len  = total;
 
-			The format of the Client Last Transaction Time option is shown below:
-
-				 0                   1                   2                   3
-				 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-				|        OPTION_CLT_TIME        |         option-len            |
-				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-				|                 client-last-transaction-time                  |
-				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-		*/
-
-		/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.4 Relay Data (47)
-		   The Relay Data option is used only in a LEASEQUERY-REPLY message and
-		   provides the relay agent information used when the client last
-		   communicated with the server.
-
-		   The format of the Relay Data option is shown below:
-
-				0                   1                   2                   3
-				0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			   |     OPTION_LQ_RELAY_DATA      |         option-len            |
-			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			   |                                                               |
-			   |                  peer-address (IPv6 address)                  |
-			   |                                                               |
-			   |                                                               |
-			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			   |                                                               |
-			   |                       DHCP-relay-message                      |
-			   .                                                               .
-			   .                                                               .
-			   .                                                               .
-			   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-		*/
-
-		/* https://www.rfc-editor.org/rfc/rfc5007#section-4.1.2.5 Client Link Option (48)
-			The Client Link option is used only in a LEASEQUERY-REPLY message and
-			identifies the links on which the client has one or more bindings.
-			It is used in reply to a query when no link-address was specified and
-			the client is found to be on more than one link.
-
-			The format of the Client Link option is shown below:
-
-				 0                   1                   2                   3
-				 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-				|     OPTION_LQ_CLIENT_LINK     |         option-len            |
-				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-				|                                                               |
-				|                  link-address (IPv6 address)                  |
-				|                                                               |
-				|                                                               |
-				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-				|                                                               |
-				|                  link-address (IPv6 address)                  |
-				|                                                               |
-				|                                                               |
-				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-				|                              ...                              |
-				+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-		*/
+		/* dest.msg_type already set to LEASEQUERY_REPLY earlier */
+		/* send reply */
+		odhcpd_send(iface->dhcpv6_event.uloop.fd, addr, iov, ARRAY_SIZE(iov), iface);
+		free_binding:
+		free_lq_client_binding(binding);
+		return;
 	}
 
 #ifdef DHCPV4_SUPPORT
@@ -1003,6 +1535,8 @@ static void relay_server_response(uint8_t *data, size_t len)
 	}
 
 	struct iovec iov = {payload_data, payload_len};
+
+	// TODO: store the relayed message.
 
 	debug("Sending a DHCPv6-reply on %s", iface->name);
 
