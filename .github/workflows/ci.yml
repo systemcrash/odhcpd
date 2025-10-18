@@ -6,28 +6,41 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.arch }}
+    name: Build ${{ matrix.arch }} (${{ matrix.ref }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: aarch64
-            gcc: /usr/bin/aarch64-linux-gnu-gcc
-            packages: gcc-aarch64-linux-gnu
-          - arch: arm
-            gcc: /usr/bin/arm-linux-gnueabi-gcc
-            packages: gcc-arm-linux-gnueabi
-          - arch: mips
-            gcc: /usr/bin/mips-linux-gnu-gcc
-            packages: gcc-mips-linux-gnu
-          - arch: x86_64
-            gcc: /usr/bin/x86_64-linux-gnu-gcc
-            packages: gcc-x86-64-linux-gnu
+        arch: [aarch64, arm, mips, x86_64]
+        ref: [master, reference]
 
     steps:
       - name: Checkout odhcpd
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          ref: ${{ 
+                  (matrix.ref == 'reference' && github.event.pull_request.number && format('refs/pull/{0}/head', github.event.pull_request.number)) || 
+                  (matrix.ref == 'master' && (github.event.pull_request.base.ref || 'master')) || 
+                  github.ref_name 
+                }}
+
+      - name: Set compiler & packages
+        run: |
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then
+            echo "GCC=/usr/bin/aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+            echo "PACKAGES=gcc-aarch64-linux-gnu" >> $GITHUB_ENV
+          elif [ "${{ matrix.arch }}" = "arm" ]; then
+            echo "GCC=/usr/bin/arm-linux-gnueabi-gcc" >> $GITHUB_ENV
+            echo "PACKAGES=gcc-arm-linux-gnueabi" >> $GITHUB_ENV
+          elif [ "${{ matrix.arch }}" = "mips" ]; then
+            echo "GCC=/usr/bin/mips-linux-gnu-gcc" >> $GITHUB_ENV
+            echo "PACKAGES=gcc-mips-linux-gnu" >> $GITHUB_ENV
+          else
+            echo "GCC=/usr/bin/x86_64-linux-gnu-gcc" >> $GITHUB_ENV
+            echo "PACKAGES=gcc-x86-64-linux-gnu" >> $GITHUB_ENV
+          fi
 
       - name: Checkout json-c
         uses: actions/checkout@v5
@@ -60,21 +73,17 @@ jobs:
           path: depends/uci
 
       - name: Install dependencies
-        run: |
-          sudo apt install ${{ matrix.packages }}
+        run: sudo apt install $PACKAGES
 
       - name: Prepare build
-        run: |
-          mkdir -p ${GITHUB_WORKSPACE}/build
+        run: mkdir -p ${GITHUB_WORKSPACE}/build
 
+      # Build dependencies
       - name: Build json-c
         working-directory: depends/json-c
         run: |
-          cmake \
-            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
-            -DCMAKE_C_COMPILER=${{ matrix.gcc }} \
-            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build \
-            -DBUILD_SHARED_LIBS=OFF -DDISABLE_EXTRA_LIBS=ON  \
+          cmake -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DCMAKE_C_COMPILER=$GCC \
+            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build -DBUILD_SHARED_LIBS=OFF -DDISABLE_EXTRA_LIBS=ON \
             --install-prefix ${GITHUB_WORKSPACE}/build
           make
           make install
@@ -82,22 +91,16 @@ jobs:
       - name: Build libnl-tiny
         working-directory: depends/libnl-tiny
         run: |
-          cmake \
-            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
-            -DCMAKE_C_COMPILER=${{ matrix.gcc }} \
-            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build \
-            --install-prefix ${GITHUB_WORKSPACE}/build
+          cmake -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DCMAKE_C_COMPILER=$GCC \
+            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build --install-prefix ${GITHUB_WORKSPACE}/build
           make
           make install
 
       - name: Build libubox
         working-directory: depends/libubox
         run: |
-          cmake \
-            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
-            -DCMAKE_C_COMPILER=${{ matrix.gcc }} \
-            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build \
-            -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF \
+          cmake -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DCMAKE_C_COMPILER=$GCC \
+            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF \
             --install-prefix ${GITHUB_WORKSPACE}/build
           make
           make install
@@ -105,11 +108,8 @@ jobs:
       - name: Build ubus
         working-directory: depends/ubus
         run: |
-          cmake \
-            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
-            -DCMAKE_C_COMPILER=${{ matrix.gcc }} \
-            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build \
-            -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF \
+          cmake -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DCMAKE_C_COMPILER=$GCC \
+            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF \
             --install-prefix ${GITHUB_WORKSPACE}/build
           make
           make install
@@ -117,50 +117,76 @@ jobs:
       - name: Build uci
         working-directory: depends/uci
         run: |
-          cmake \
-            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
-            -DCMAKE_C_COMPILER=${{ matrix.gcc }} \
-            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build \
-            -DBUILD_LUA=OFF \
+          cmake -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DCMAKE_C_COMPILER=$GCC \
+            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build -DBUILD_LUA=OFF \
             --install-prefix ${GITHUB_WORKSPACE}/build
           make
           make install
 
+      # Build odhcpd variants
       - name: Build odhcpd (basic)
         run: |
-          cmake \
-            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
-            -DCMAKE_C_COMPILER=${{ matrix.gcc }} \
-            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build \
-            -B build/odhcpd-basic
+          cmake -S . -B build -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DCMAKE_C_COMPILER=$GCC \
+            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build -B build/odhcpd-basic \
+            -DCMAKE_C_FLAGS="-g3 -Os -Wall -Wextra -Werror -Werror=implicit-function-declaration \
+            -Wformat -Werror=format-security -Werror=format-nonliteral -Wno-unused-parameter -Wmissing-declarations -D_GNU_SOURCE"
           make -C build/odhcpd-basic
 
       - name: Build odhcpd (DHCPv4)
         run: |
-          cmake \
-            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
-            -DCMAKE_C_COMPILER=${{ matrix.gcc }} \
-            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build \
-            -DDHCPV4_SUPPORT=ON \
-            -B build/odhcpd-dhcpv4
+          cmake -S . -B build -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DCMAKE_C_COMPILER=$GCC \
+            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build -DDHCPV4_SUPPORT=ON -B build/odhcpd-dhcpv4 \
+            -DCMAKE_C_FLAGS="-g3 -Os -Wall -Wextra -Werror -Werror=implicit-function-declaration \
+            -Wformat -Werror=format-security -Werror=format-nonliteral -Wno-unused-parameter -Wmissing-declarations -D_GNU_SOURCE"
           make -C build/odhcpd-dhcpv4
 
       - name: Build odhcpd (UBUS)
         run: |
-          cmake \
-            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
-            -DCMAKE_C_COMPILER=${{ matrix.gcc }} \
-            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build \
-            -DUBUS=ON \
-            -B build/odhcpd-ubus
+          cmake -S . -B build -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DCMAKE_C_COMPILER=$GCC \
+            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build -DUBUS=ON -B build/odhcpd-ubus \
+            -DCMAKE_C_FLAGS="-g3 -Os -Wall -Wextra -Werror -Werror=implicit-function-declaration \
+            -Wformat -Werror=format-security -Werror=format-nonliteral -Wno-unused-parameter -Wmissing-declarations -D_GNU_SOURCE"
           make -C build/odhcpd-ubus
 
       - name: Build odhcpd (full)
         run: |
-          cmake \
-            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
-            -DCMAKE_C_COMPILER=${{ matrix.gcc }} \
-            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build \
-            -DDHCPV4_SUPPORT=ON -DUBUS=ON \
-            -B build/odhcpd-full
+          cmake -S . -B build -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DCMAKE_C_COMPILER=$GCC \
+            -DCMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/build -DDHCPV4_SUPPORT=ON -DUBUS=ON -B build/odhcpd-full \
+            -DCMAKE_C_FLAGS="-g3 -Os -Wall -Wextra -Werror -Werror=implicit-function-declaration \
+            -Wformat -Werror=format-security -Werror=format-nonliteral -Wno-unused-parameter -Wmissing-declarations -D_GNU_SOURCE"
           make -C build/odhcpd-full
+
+      # Upload artifacts
+      - name: Upload all odhcpd artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: odhcpd-${{ matrix.arch }}-${{ matrix.ref }}
+          path: |
+            build/**/odhcpd
+          if-no-files-found: error
+
+  compare:
+    name: Compare sizes (Reference vs master)
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compare binary sizes
+        run: |
+          echo "### odhcpd binary size comparison :balance_scale:" >> $GITHUB_STEP_SUMMARY
+          echo "| Arch | Variant | Master | Reference | Δ (bytes) |" >> $GITHUB_STEP_SUMMARY
+          echo "| :---: | :---: | ---: | ---: | ---: |" >> $GITHUB_STEP_SUMMARY
+
+          for arch in aarch64 arm mips x86_64; do
+            for variant in basic dhcpv4 ubus full; do
+              master_size=$(stat -c%s artifacts/odhcpd-${arch}-master/odhcpd-${variant}/odhcpd 2>/dev/null || echo 0)
+              reference_size=$(stat -c%s artifacts/odhcpd-${arch}-reference/odhcpd-${variant}/odhcpd 2>/dev/null || echo 0)
+              delta=$((reference_size - master_size))
+              delta=$( [ "$delta" -gt 0 ] && echo "🔺+$delta" || echo "🟢$delta" )
+              echo "| $arch | $variant | $master_size | $reference_size | $delta |" >> $GITHUB_STEP_SUMMARY
+            done
+          done
