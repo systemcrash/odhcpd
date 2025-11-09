@@ -68,6 +68,8 @@
 #define DHCPV6_OPT_BOOTFILE_URL 59
 #define DHCPV6_OPT_BOOTFILE_PARAM 60
 #define DHCPV6_OPT_CLIENT_ARCH 61
+/* RFC 6603 */
+#define DHCPV6_OPT_PD_EXCLUDE 67
 #define DHCPV6_OPT_SOL_MAX_RT 82
 #define DHCPV6_OPT_INF_MAX_RT 83
 #define DHCPV6_OPT_DHCPV4_MSG 87
@@ -162,6 +164,13 @@ struct dhcpv6_cer_id {
 	uint8_t auth[16];
 	struct in6_addr addr;
 };
+
+struct dhcpv6_pd_exclude {
+	uint16_t type;
+	uint16_t len;
+	uint8_t prefix_len;
+	uint8_t subnet_id[16];
+} _packed;
 
 #define dhcpv6_for_each_option(start, end, otype, olen, odata)\
 	for (uint8_t *_o = (uint8_t*)(start); _o + 4 <= (end) &&\

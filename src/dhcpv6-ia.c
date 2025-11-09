@@ -941,6 +941,61 @@ static void valid_until_cb(struct uloop_timeout *event)
 	uloop_timeout_set(event, 1000);
 }
 
+
+static size_t
+build_pd_exclude_opt(uint8_t *buf, size_t buflen,
+					 struct in6_addr *delegated, uint8_t delegated_len,
+					 struct in6_addr *excluded, uint8_t excluded_len)
+{
+	// RFC 6603 sanity: excluded must be within delegated
+	if (excluded_len <= delegated_len)
+		return 0; // no exclusion or invalid
+
+	// Calculate subnet-id length in bytes
+	uint8_t c = excluded_len - delegated_len - 1; // the IPv6_subnet_ID_length-1 in bits
+	uint8_t subnet_bytes = (c / 8) + 1; // the IPv6_subnet_ID_length in octets
+
+	if (subnet_bytes > 16)
+		return 0; // impossible, sanity check
+
+	// Represent p2 as 128-bit big-endian integer
+	const uint8_t *p2 = excluded->s6_addr;
+
+	// Left shift p2 by 'a' bits (delegated_len)
+	uint8_t shifted[16] = {0};
+	uint8_t shift = delegated_len;
+	for (uint8_t i = 0; i < 16; i++) {
+		uint8_t bitpos = i * 8;
+		uint8_t src_bit = bitpos + shift;
+		if (src_bit >= 128)
+			break;
+
+		uint8_t byte = src_bit / 8;
+		uint8_t offset = src_bit % 8;
+		uint16_t val = (p2[byte] << 8);
+		if (byte + 1 < 16)
+			val |= p2[byte + 1];
+
+		shifted[i] = (val << offset) >> 8;
+	}
+
+	// RFC 6603 option structure
+	struct dhcpv6_pd_exclude opt = {
+		.type = htons(DHCPV6_OPT_PD_EXCLUDE),
+		.len = htons(1 + subnet_bytes),
+		.prefix_len = excluded_len
+	};
+
+    size_t excl_size = 4 + 1 + subnet_bytes;
+    if (buflen < excl_size)
+        return 0;
+
+    memcpy(opt.subnet_id, shifted, subnet_bytes);
+    memcpy(buf, &opt, excl_size);
+
+    return excl_size;
+}
+
 static size_t build_ia(uint8_t *buf, size_t buflen, uint16_t status,
 		const struct dhcpv6_ia_hdr *ia, struct dhcpv6_lease *a,
 		struct interface *iface, bool request)
@@ -1011,14 +1066,14 @@ static size_t build_ia(uint8_t *buf, size_t buflen, uint16_t status,
 			if (!valid_addr(&addrs[i], now))
 				continue;
 
-			/* Filter Out Prefixes */
-			if (ADDR_MATCH_PIO_FILTER(&addrs[i], iface)) {
-				char addrbuf[INET6_ADDRSTRLEN];
-				info("Address %s filtered out on %s",
-				     inet_ntop(AF_INET6, &addrs[i].addr.in6, addrbuf, sizeof(addrbuf)),
-				     iface->name);
-				continue;
-			}
+			// /* Filter Out Prefixes */
+			// if (ADDR_MATCH_PIO_FILTER(&addrs[i], iface)) {
+			// 	char addrbuf[INET6_ADDRSTRLEN];
+			// 	info("Address %s filtered out on %s",
+			// 		 inet_ntop(AF_INET6, &addrs[i].addr.in6, addrbuf, sizeof(addrbuf)),
+			// 		 iface->name);
+			// 	continue;
+			// }
 
 			prefix_preferred_lt = addrs[i].preferred_lt;
 			prefix_valid_lt = addrs[i].valid_lt;
@@ -1063,7 +1118,26 @@ static size_t build_ia(uint8_t *buf, size_t buflen, uint16_t status,
 					return 0;
 
 				memcpy(buf + ia_len, &o_ia_p, sizeof(o_ia_p));
+				size_t ia_offset = ia_len;
 				ia_len += sizeof(o_ia_p);
+
+				if (iface->pio_filter_length > 0 &&
+					ADDR_MATCH_PIO_FILTER(&addrs[i], iface)) {
+					char addrbuf[INET6_ADDRSTRLEN];
+					debug("Adding OPTION_PD_EXCLUDE to OPTION_IAPREFIX for %s",
+						inet_ntop(AF_INET6, &addrs[i].addr.in6, addrbuf, sizeof(addrbuf)));
+					/* RFC 6603 */
+					uint16_t old_len = sizeof(o_ia_p) - 4;
+					size_t excl_size = build_pd_exclude_opt(buf + ia_len, buflen - ia_len,
+							&iface->pio_filter_addr, iface->pio_filter_length, // delegated
+							&addrs[i].addr.in6, a->length); // excluded
+					if (excl_size > 0) {
+						o_ia_p.len = htons(old_len + excl_size);
+						memcpy(buf + ia_offset, &o_ia_p, sizeof(o_ia_p));
+						ia_len += excl_size;
+					}
+				}
+
 			}
 
 			if (a->flags & OAF_DHCPV6_NA) {
@@ -1518,7 +1592,7 @@ proceed:
 			bool assigned = !!a;
 
 			if (!a) {
-				if ((!iface->no_dynamic_dhcp || (lease_cfg && is_na)) &&
+				if ((!iface->no_dynamic_dhcp || lease_cfg) &&
 				    (iface->dhcpv6_pd || iface->dhcpv6_na)) {
 					/* Create new binding */
 					a = dhcpv6_alloc_lease(clid_len);
@@ -1543,9 +1617,11 @@ proceed:
 						else
 							odhcpd_urandom(a->key, sizeof(a->key));
 
-						if (is_pd && iface->dhcpv6_pd)
-							while (!(assigned = assign_pd(iface, a)) &&
-							       ++a->length <= 64);
+						if (is_pd && iface->dhcpv6_pd) {
+							do {
+								assigned = assign_pd(iface, a);
+							} while (!assigned && ++a->length <= 64);
+						}
 						else if (is_na && iface->dhcpv6_na)
 							assigned = assign_na(iface, a);
 
