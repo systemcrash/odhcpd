@@ -1110,6 +1110,7 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 		INIT_LIST_HEAD(&iface->ia_assignments);
 		INIT_LIST_HEAD(&iface->dhcpv4_leases);
 		INIT_LIST_HEAD(&iface->dhcpv4_fr_ips);
+		INIT_LIST_HEAD(&iface->pd_pools);
 
 		set_interface_defaults(iface);
 

@@ -178,6 +178,39 @@ static void refresh_iface_addr4(int ifindex)
 	free(addr);
 }
 
+/* called during interface init / on address change */
+void iface_init_pd_pools(struct interface *iface)
+{
+    struct pd_pool *pool, *tmp;
+
+    /* Clear old PD pools safely */
+    list_for_each_entry_safe(pool, tmp, &iface->pd_pools, list) {
+        list_del(&pool->list);
+        free(pool);
+    }
+
+    INIT_LIST_HEAD(&iface->pd_pools);
+
+    for (size_t i = 0; i < iface->addr6_len; i++) {
+        struct odhcpd_ipaddr *a = &iface->addr6[i];
+
+        if (IN6_IS_ADDR_LINKLOCAL(&a->addr) || a->prefix > 128)
+            continue;
+
+        struct pd_pool *pnew = calloc(1, sizeof(*pnew));
+        if (!pnew)
+            continue;
+
+        // note: assign the in6, since pools take in6_addr
+        pnew->base = a->addr.in6;
+        pnew->base_len = a->prefix;
+        INIT_LIST_HEAD(&pnew->assignments);
+
+        list_add_tail(&pnew->list, &iface->pd_pools);
+        debug("PD pool added on %s: %N/%d", iface->ifname, &pnew->base, pnew->base_len);
+    }
+}
+
 static void refresh_iface_addr6(int ifindex)
 {
 	struct odhcpd_ipaddr *addr = NULL;
@@ -213,6 +246,7 @@ static void refresh_iface_addr6(int ifindex)
 
 		iface->addr6 = addr;
 		iface->addr6_len = len;
+		iface_init_pd_pools(iface);
 
 		if (change)
 			call_netevent_handler_list(NETEV_ADDR6LIST_CHANGE, &event_info);

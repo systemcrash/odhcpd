@@ -270,8 +270,9 @@ struct dhcpv6_lease {
 
 	union {
 		uint64_t assigned_host_id;
-		uint32_t assigned_subnet_id;
+		/* uint32_t assigned_subnet_id; // legacy */
 	};
+	struct in6_addr assigned_prefix;
 	uint32_t iaid;
 	uint8_t length; // length == 128 -> IA_NA, length <= 64 -> IA_PD
 
@@ -330,6 +331,16 @@ struct ra_pio {
 };
 
 
+/* per-interface PD pools */
+struct pd_pool {
+	struct list_head list;
+	struct in6_addr base;
+	uint8_t base_len;
+	/* leases allocated within this pool; kept sorted by assigned_prefix */
+	struct list_head assignments;
+};
+
+
 struct interface {
 	struct avl_node avl;
 
@@ -351,6 +362,8 @@ struct interface {
 	// DHCPv6 runtime data
 	struct odhcpd_event dhcpv6_event;
 	struct list_head ia_assignments;
+	/* multiple PD pools per interface */
+	struct list_head pd_pools;
 
 	// NDP runtime data
 	struct odhcpd_event ndp_event;
@@ -603,6 +616,7 @@ int netlink_setup_addr(struct odhcpd_ipaddr *addr,
 		const int ifindex, const bool v6, const bool add);
 void netlink_dump_neigh_table(const bool proxy);
 void netlink_dump_addr_table(const bool v6);
+void iface_init_pd_pools(struct interface *iface);
 
 // Exported module initializers
 int netlink_init(void);
