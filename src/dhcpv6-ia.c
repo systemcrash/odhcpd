@@ -47,6 +47,7 @@ static void handle_addrlist_change(struct netevent_handler_info *info);
 static void start_reconf(struct dhcpv6_lease *a);
 static void stop_reconf(struct dhcpv6_lease *a);
 static void valid_until_cb(struct uloop_timeout *event);
+static void in6_add(const struct in6_addr *a, const struct in6_addr *b, struct in6_addr *out);
 
 static struct netevent_handler dhcpv6_netevent_handler = { .cb = dhcpv6_netevent_cb, };
 static struct uloop_timeout valid_until_timeout = {.cb = valid_until_cb};
@@ -334,13 +335,17 @@ void dhcpv6_ia_enum_addrs(struct interface *iface, struct dhcpv6_lease *c,
 				continue;
 
 			addr = in6_from_prefix_and_iid(&addrs[i], c->assigned_host_id);
-		} else {
+		} else if (c->flags & OAF_DHCPV6_PD) {
 			if (!valid_prefix_length(c, addrs[i].prefix))
 				continue;
 
-			addr = addrs[i].addr.in6;
-			addr.s6_addr32[1] |= htonl(c->assigned_subnet_id);
-			addr.s6_addr32[2] = addr.s6_addr32[3] = 0;
+			struct in6_addr subnet = c->assigned_prefix;  // full 128-bit subnet ID
+			memset(&subnet.s6_addr[0], 0, 16 - (c->length + 7) / 8);  // zero prefix bits if needed
+
+			// Add subnet ID to base prefix
+			in6_add(&addrs[i].addr.in6, &subnet, &addr);
+		} else {
+			continue;
 		}
 
 		preferred_lt = addrs[i].preferred_lt;
@@ -587,12 +592,21 @@ void dhcpv6_ia_write_statefile(void)
 									(int64_t)(ctxt.c->valid_until - now + wall_time) :
 									(INFINITE_VALID(ctxt.c->valid_until) ? -1 : 0)));
 
-					if (ctxt.c->flags & OAF_DHCPV6_NA)
+					if (ctxt.c->flags & OAF_DHCPV6_NA) {
 						ctxt.buf_idx += snprintf(ctxt.buf + ctxt.buf_idx, ctxt.buf_len - ctxt.buf_idx,
 									 "%" PRIx64" %u ", ctxt.c->assigned_host_id, (unsigned)ctxt.c->length);
-					else
-						ctxt.buf_idx += snprintf(ctxt.buf + ctxt.buf_idx, ctxt.buf_len - ctxt.buf_idx,
-									 "%" PRIx32" %u ", ctxt.c->assigned_subnet_id, (unsigned)ctxt.c->length);
+					} else if (ctxt.c->flags & OAF_DHCPV6_PD) {
+						// Convert 128-bit assigned_prefix to hex
+						char subnet_hex[33]; // 128 bits = 16 bytes = 32 hex chars + null
+						for (int i = 0; i < 16; i++)
+							snprintf(&subnet_hex[i*2], 3, "%02x", ctxt.c->assigned_prefix.s6_addr[i]);
+
+						ctxt.buf_idx += snprintf(ctxt.buf + ctxt.buf_idx,
+												 ctxt.buf_len - ctxt.buf_idx,
+												 "%s %u ",
+												 subnet_hex,
+												 (unsigned)ctxt.c->length);
+					}
 
 					if (INFINITE_VALID(ctxt.c->valid_until) || ctxt.c->valid_until > now)
 						dhcpv6_ia_enum_addrs(ctxt.iface, ctxt.c, now,
@@ -687,8 +701,8 @@ static void __apply_lease(struct dhcpv6_lease *a,
 			continue;
 
 		prefix = addrs[i].addr.in6;
-		prefix.s6_addr32[1] |= htonl(a->assigned_subnet_id);
-		prefix.s6_addr32[2] = prefix.s6_addr32[3] = 0;
+		// prefix.s6_addr32[1] |= htonl(a->assigned_subnet_id);
+		// prefix.s6_addr32[2] = prefix.s6_addr32[3] = 0;
 		netlink_setup_route(&prefix, (a->managed_size) ? addrs[i].prefix : a->length,
 				a->iface->ifindex, &a->peer.sin6_addr, 1024, add);
 	}
@@ -716,15 +730,33 @@ static void set_border_assignment_size(struct interface *iface, struct dhcpv6_le
 			continue;
 
 		if (addr->preferred_lt > (uint32_t)now &&
-		    addr->prefix < 64 &&
-		    addr->prefix > minprefix)
+			addr->prefix < 128 &&
+			addr->prefix > minprefix)
 			minprefix = addr->prefix;
 	}
 
-	if (minprefix > 32 && minprefix <= 64)
-		b->assigned_subnet_id = 1U << (64 - minprefix);
-	else
-		b->assigned_subnet_id = 0;
+	// Clear the 128-bit subnet
+	memset(&b->assigned_prefix, 0, sizeof(b->assigned_prefix));
+
+	if (minprefix < 0)
+		return;
+
+	/*
+	 * For /65–/128, compute the subnet as 128-bit value:
+	 * shift 1 left by (128 - prefix) bits and place in lower bytes
+	 */
+	int bits = 128 - minprefix;
+	uint8_t mask[16] = {0};
+	int byte_idx = 15; // start from last byte
+
+	while (bits > 0) {
+		int take = bits > 8 ? 8 : bits;
+		mask[byte_idx] = (uint8_t)(1U << (take - 1));
+		bits -= take;
+		byte_idx--;
+	}
+
+	memcpy(&b->assigned_prefix.s6_addr, mask, 16);
 }
 
 /* More data was received from TCP connection */
@@ -815,6 +847,182 @@ static void managed_handle_pd_done(struct ustream *s)
 		c->fr_cnt = 1;
 }
 
+/* 128-bit helpers (in6_addr arithmetic and masks) */
+static void in6_prefix_mask(uint8_t len, struct in6_addr *out)
+{
+	uint8_t *m = out->s6_addr;
+	memset(m, 0, 16);
+	for (int i = 0; i < 16 && len > 0; i++) {
+		if (len >= 8) {
+			m[i] = 0xFF;
+			len -= 8;
+		} else {
+			m[i] = (uint8_t)(0xFF << (8 - len));
+			len = 0;
+		}
+	}
+}
+
+/* bitwise AND: out = a & b */
+static void in6_and(const struct in6_addr *a, const struct in6_addr *b, struct in6_addr *out)
+{
+	for (int i = 0; i < 16; i++) out->s6_addr[i] = a->s6_addr[i] & b->s6_addr[i];
+}
+
+/* bitwise OR: out = a | b */
+/*
+static void in6_or(const struct in6_addr *a, const struct in6_addr *b, struct in6_addr *out)
+{
+	for (int i = 0; i < 16; i++) out->s6_addr[i] = a->s6_addr[i] | b->s6_addr[i];
+}
+*/
+
+/* compare two in6_addr: return -1,0,1 like memcmp */
+static int in6_cmp(const struct in6_addr *a, const struct in6_addr *b)
+{
+	return memcmp(a->s6_addr, b->s6_addr, 16);
+}
+
+/* out = a + b (big-endian 128-bit add) */
+static void in6_add(const struct in6_addr *a, const struct in6_addr *b, struct in6_addr *out)
+{
+	uint8_t carry = 0;
+	for (int i = 15; i >= 0; i--) {
+		uint8_t sum = (uint8_t)a->s6_addr[i] + (uint8_t)b->s6_addr[i] + carry;
+		out->s6_addr[i] = (uint8_t)(sum & 0xff);
+		carry = sum >> 8;
+	}
+}
+
+/* out = a - b (caller ensures a >= b) */
+/*
+static void in6_sub(const struct in6_addr *a, const struct in6_addr *b, struct in6_addr *out)
+{
+	int borrow = 0;
+	for (int i = 15; i >= 0; i--) {
+		int diff = (int)a->s6_addr[i] - (int)b->s6_addr[i] - borrow;
+		if (diff < 0) {
+			diff += 256;
+			borrow = 1;
+		} else borrow = 0;
+		out->s6_addr[i] = (uint8_t)diff;
+	}
+}
+*/
+
+/* out = base & mask i.e. base truncated with prefix length (network address) */
+static void in6_prefix_start(const struct in6_addr *base, uint8_t prefix_len, struct in6_addr *out)
+{
+	struct in6_addr mask;
+	in6_prefix_mask(prefix_len, &mask);
+	in6_and(base, &mask, out);
+}
+
+/*	Add a numeric offset (big-endian) given as a 128-bit value held in an array,
+	here we provide an add where "units" is number of addresses to add (as uint128-like).
+	For subnet stepping, units will be 1 << (128 - subnet_len) — but we compute it as shifting a 128-bit one. */
+
+/* create step = 2^(128 - prefix_length) as an in6_addr (i.e. number of addresses in that prefix) */
+static void in6_step_for_prefix(uint8_t prefix_length, struct in6_addr *step)
+{
+	memset(step->s6_addr, 0, 16);
+	if (prefix_length >= 128) {
+		/* step = 1 << 0 == 1 */
+		step->s6_addr[15] = 1;
+		return;
+	}
+	/* set 1 at bit position `shift` counted from MSB=bit127 to LSB=bit0 */
+	int shift = 128 - prefix_length;
+
+	/* place a 1 at bit index shift counted from LSB (i.e. 2^shift). We'll set a big-endian byte accordingly */
+	/* position from MSB: pos = 127 - shift */
+	/* easier: compute byte index and bit in that byte */
+	int byte_with_bit = 15 - (shift / 8);
+	int bit_in_byte = shift % 8; /* 0 is LSB */
+	if (byte_with_bit >= 0 && byte_with_bit < 16) {
+		step->s6_addr[byte_with_bit] = (uint8_t)(1u << bit_in_byte);
+		/* but bit_in_byte is little-endian within byte; our network-order arithmetic expects MSB-first when comparing.
+		   We're consistent if we always treat s6_addr[] as big-endian numbers for cmp/add. The bit set above corresponds to the correct numeric value. */
+	}
+}
+
+/* end = start + step */
+static void in6_range_end(const struct in6_addr *start, const struct in6_addr *step, struct in6_addr *end)
+{
+	in6_add(start, step, end);
+}
+
+/* returns true if [start1, end1) overlaps [start2, end2) (end is exclusive) */
+static bool prefixes_overlap_range(const struct in6_addr *s1, const struct in6_addr *e1,
+								   const struct in6_addr *s2, const struct in6_addr *e2)
+{
+	/* overlap exists if s1 < e2 && s2 < e1 */
+	if (in6_cmp(s1, e2) >= 0) return false;
+	if (in6_cmp(s2, e1) >= 0) return false;
+	return true;
+}
+
+/* return true if candidate (start,len) is wholly contained in pool (pool_base, pool_len) */
+/* compute whether `candidate` net of length `prefix_length` fits in iface base/pool (pd_base/pd_base_len) */
+static bool candidate_fits_within_pool(const struct in6_addr *pool_base, uint8_t pool_len,
+								const struct in6_addr *candidate_start, uint8_t prefix_length)
+{
+	struct in6_addr pool_start, pool_step, pool_end;
+	in6_prefix_start(pool_base, pool_len, &pool_start);
+	in6_step_for_prefix(pool_len, &pool_step);
+	in6_range_end(&pool_start, &pool_step, &pool_end);
+
+	/* also ensure candidate prefix is contained in pool: candidate_start masked by pool_mask equals pool_start
+	   and candidate_end <= pool_end. Simpler: compute candidate end and pool end and check ordering. */
+	struct in6_addr candidate_end, step_cand;
+	in6_step_for_prefix(prefix_length, &step_cand);
+	in6_range_end(candidate_start, &step_cand, &candidate_end);
+
+	/* candidate_start >= pool_start && candidate_end <= pool_end */
+	if (in6_cmp(candidate_start, &pool_start) < 0) return false;
+	if (in6_cmp(&candidate_end, &pool_end) > 0) return false;
+	return true;
+}
+
+/* Align addr 'a' up to the next boundary of prefix 'prefix_length' (i.e. zero low bits).
+ * result in 'aligned'
+ */
+static void in6_align_up(const struct in6_addr *a, uint8_t prefix_length, struct in6_addr *aligned)
+{
+	struct in6_addr mask;
+	in6_prefix_mask(prefix_length, &mask);
+	in6_and(a, &mask, aligned);
+
+	if (in6_cmp(aligned, a) < 0) {
+		/* aligned < a -> advance by one step */
+		struct in6_addr step;
+		in6_step_for_prefix(prefix_length, &step);
+		in6_add(aligned, &step, aligned);
+	}
+}
+
+/* Assume: struct interface has pd_base (in6_addr) and pd_base_len; iface->ia_assignments is sorted by assigned_prefix ascending. */
+/* Also assume: each lease struct (c) has c->assigned_prefix (in6_addr) and c->length (prefix len). */
+
+/* Insert lease sorted by assigned_prefix into pool->assignments */
+static void pd_pool_insert_sorted(struct pd_pool *pool, struct dhcpv6_lease *l)
+{
+	struct dhcpv6_lease *c;
+	if (list_empty(&pool->assignments)) {
+		list_add(&l->head, &pool->assignments);
+		return;
+	}
+	list_for_each_entry(c, &pool->assignments, head) {
+		if (in6_cmp(&l->assigned_prefix, &c->assigned_prefix) < 0) {
+			list_add_tail(&l->head, &c->head);
+			return;
+		}
+	}
+	/* append if not inserted */
+	list_add_tail(&l->head, &pool->assignments);
+}
+
+/* assign_pd: per-interface multiple pools, up to 128-bit safe */
 static bool assign_pd(struct interface *iface, struct dhcpv6_lease *assign)
 {
 	struct dhcpv6_lease *c;
@@ -851,51 +1059,138 @@ static bool assign_pd(struct interface *iface, struct dhcpv6_lease *assign)
 				return true;
 		}
 
-		return false;
-	} else if (iface->addr6_len < 1)
+	}
+
+	/* No pools configured? fail */
+	if (list_empty(&iface->pd_pools))
 		return false;
 
-	/* Try honoring the hint first */
-	uint32_t current = 1, asize = (1 << (64 - assign->length)) - 1;
-	if (assign->assigned_subnet_id) {
-		list_for_each_entry(c, &iface->ia_assignments, head) {
-			if (c->flags & OAF_DHCPV6_NA)
+	/* clamp requested length to [iface->dhcpv6_pd_min_len .. 128] */
+	if (assign->length < iface->dhcpv6_pd_min_len)
+		assign->length = iface->dhcpv6_pd_min_len;
+	if (assign->length > 128)
+		assign->length = 128;
+
+	/* Step size for this prefix */
+	struct in6_addr step;
+	in6_step_for_prefix(assign->length, &step);
+
+	/* If client provided a hint (assign->assigned_prefix != ::0), try to honor it (search all pools) */
+	struct in6_addr zero = { .s6_addr = {0} };
+	if (in6_cmp(&assign->assigned_prefix, &zero) != 0) {
+		struct pd_pool *pool;
+		list_for_each_entry(pool, &iface->pd_pools, list) {
+			if (!candidate_fits_within_pool(&pool->base, pool->base_len, &assign->assigned_prefix, assign->length))
 				continue;
 
-			if (assign->assigned_subnet_id >= current && assign->assigned_subnet_id + asize < c->assigned_subnet_id) {
-				list_add_tail(&assign->head, &c->head);
+			/* check for overlap with existing assignments in that pool */
+			struct in6_addr cand_end;
+			in6_range_end(&assign->assigned_prefix, &step, &cand_end);
+			bool conflict = false;
 
+			list_for_each_entry(c, &pool->assignments, head) {
+				if (c->flags & OAF_DHCPV6_NA)
+					continue;
+
+				struct in6_addr cstep, cend;
+
+				in6_step_for_prefix(c->length, &cstep);
+				in6_range_end(&c->assigned_prefix, &cstep, &cend);
+
+				if (prefixes_overlap_range(&assign->assigned_prefix, &cand_end, &c->assigned_prefix, &cend)) {
+					conflict = true; break;
+				}
+			}
+
+			if (!conflict) {
+				/* found a pool where hint fits */
+				pd_pool_insert_sorted(pool, assign);
 				if (assign->flags & OAF_BOUND)
 					apply_lease(assign, true);
 
 				return true;
 			}
+		}
+	} else {
+		/* Otherwise, try to allocate from each pool in order (first-fit gap scanning) */
+		struct pd_pool *pool;
+		list_for_each_entry(pool, &iface->pd_pools, list) {
+			/* compute pool_start and pool_end */
+			struct in6_addr pool_start, pool_step, pool_end;
 
-			current = (c->assigned_subnet_id + (1 << (64 - c->length)));
+			in6_prefix_start(&pool->base, pool->base_len, &pool_start);
+			in6_step_for_prefix(pool->base_len, &pool_step);
+			in6_range_end(&pool_start, &pool_step, &pool_end);
+
+			/* If pool empty, take first aligned candidate inside pool */
+			if (list_empty(&pool->assignments)) {
+				struct in6_addr candidate;
+
+				in6_align_up(&pool_start, assign->length, &candidate);
+
+				if (candidate_fits_within_pool(&pool->base, pool->base_len, &candidate, assign->length)) {
+					assign->assigned_prefix = candidate;
+					pd_pool_insert_sorted(pool, assign);
+
+					if (assign->flags & OAF_BOUND)
+						apply_lease(assign, true);
+
+					return true;
+				}
+				continue;
+			}
+
+			/* walk assignments and find gap between prev_end and next start */
+			struct in6_addr prev_end = pool_start;
+			// bool allocated = false;
+			list_for_each_entry(c, &pool->assignments, head) {
+				if (c->flags & OAF_DHCPV6_NA)
+					continue;
+
+				/* compute candidate aligned at or after prev_end */
+				struct in6_addr candidate;
+				in6_align_up(&prev_end, assign->length, &candidate);
+				struct in6_addr candidate_end; in6_range_end(&candidate, &step, &candidate_end);
+
+				/* cstart and cend */
+				struct in6_addr cstep, cend;
+
+				in6_step_for_prefix(c->length, &cstep);
+				in6_range_end(&c->assigned_prefix, &cstep, &cend);
+
+				if (in6_cmp(&candidate_end, &c->assigned_prefix) <= 0 &&
+					candidate_fits_within_pool(&pool->base, pool->base_len, &candidate, assign->length)) {
+					assign->assigned_prefix = candidate;
+					pd_pool_insert_sorted(pool, assign);
+
+					if (assign->flags & OAF_BOUND)
+						apply_lease(assign, true);
+
+					return true;
+				}
+
+				/* advance prev_end = max(prev_end, cend) */
+				if (in6_cmp(&cend, &prev_end) > 0)
+					prev_end = cend;
+			}
+
+			/* try place at prev_end */
+			struct in6_addr candidate;
+
+			in6_align_up(&prev_end, assign->length, &candidate);
+
+			if (candidate_fits_within_pool(&pool->base, pool->base_len, &candidate, assign->length)) {
+				assign->assigned_prefix = candidate;
+				pd_pool_insert_sorted(pool, assign);
+				if (assign->flags & OAF_BOUND)
+					apply_lease(assign, true);
+
+				return true;
+			}
 		}
 	}
 
-	/* Fallback to a variable assignment */
-	current = 1;
-	list_for_each_entry(c, &iface->ia_assignments, head) {
-		if (c->flags & OAF_DHCPV6_NA)
-			continue;
-
-		current = (current + asize) & (~asize);
-
-		if (current + asize < c->assigned_subnet_id) {
-			assign->assigned_subnet_id = current;
-			list_add_tail(&assign->head, &c->head);
-
-			if (assign->flags & OAF_BOUND)
-				apply_lease(assign, true);
-
-			return true;
-		}
-
-		current = (c->assigned_subnet_id + (1 << (64 - c->length)));
-	}
-
+	/* exhausted all pools */
 	return false;
 }
 
@@ -995,7 +1290,7 @@ static void handle_addrlist_change(struct netevent_handler_info *info)
 		    c->managed_size)
 			continue;
 
-		if (c->assigned_subnet_id >= border->assigned_subnet_id)
+		if (in6_cmp(&border->assigned_prefix, &c->assigned_prefix) <= 0)
 			list_move(&c->head, &reassign);
 		else if (c->flags & OAF_BOUND)
 			apply_lease(c, true);
@@ -1184,8 +1479,8 @@ static size_t build_ia(uint8_t *buf, size_t buflen, uint16_t status,
 					.addr = addrs[i].addr.in6,
 				};
 
-				o_ia_p.addr.s6_addr32[1] |= htonl(a->assigned_subnet_id);
-				o_ia_p.addr.s6_addr32[2] = o_ia_p.addr.s6_addr32[3] = 0;
+				// o_ia_p.addr.s6_addr32[1] |= htonl(a->assigned_subnet_id);
+				// o_ia_p.addr.s6_addr32[2] = o_ia_p.addr.s6_addr32[3] = 0;
 
 				if (!valid_prefix_length(a, addrs[i].prefix))
 					continue;
@@ -1275,8 +1570,8 @@ static size_t build_ia(uint8_t *buf, size_t buflen, uint16_t status,
 
 					if (ia->type == htons(DHCPV6_OPT_IA_PD)) {
 						addr = addrs[i].addr.in6;
-						addr.s6_addr32[1] |= htonl(a->assigned_subnet_id);
-						addr.s6_addr32[2] = addr.s6_addr32[3] = 0;
+						// addr.s6_addr32[1] |= htonl(a->assigned_subnet_id);
+						// addr.s6_addr32[2] = addr.s6_addr32[3] = 0;
 
 						if (!memcmp(&ia_p->addr, &addr, sizeof(addr)) &&
 								ia_p->prefix == ((a->managed) ? addrs[i].prefix : a->length))
@@ -1504,7 +1799,7 @@ ssize_t dhcpv6_ia_handle_IAs(uint8_t *buf, size_t buflen, struct interface *ifac
 		struct dhcpv6_ia_hdr *ia = (struct dhcpv6_ia_hdr*)&odata[-4];
 		size_t ia_response_len = 0;
 		uint8_t reqlen = (is_pd) ? 62 : 128;
-		uint32_t reqhint = 0;
+		struct in6_addr reqhint;
 		struct lease_cfg *lease_cfg;
 
 		lease_cfg = config_find_lease_cfg_by_duid_and_iaid(clid_data, clid_len, ntohl(ia->iaid));
@@ -1522,9 +1817,10 @@ ssize_t dhcpv6_ia_handle_IAs(uint8_t *buf, size_t buflen, struct interface *ifac
 				struct dhcpv6_ia_prefix *p = (struct dhcpv6_ia_prefix*)&sdata[-4];
 				if (p->prefix) {
 					reqlen = p->prefix;
-					reqhint = ntohl(p->addr.s6_addr32[1]);
-					if (reqlen > 32 && reqlen <= 64)
-						reqhint &= (1U << (64 - reqlen)) - 1;
+					// reqhint = ntohl(p->addr.s6_addr32[1]);
+					// if (reqlen > 32 && reqlen <= 64)
+					// 	reqhint &= (1U << (64 - reqlen)) - 1;
+					reqhint = p->addr;
 				}
 			}
 
@@ -1665,7 +1961,7 @@ proceed:
 						if (is_na)
 							a->assigned_host_id = lease_cfg ? lease_cfg->hostid : 0;
 						else
-							a->assigned_subnet_id = reqhint;
+							a->assigned_prefix = reqhint;
 						a->valid_until =  now;
 						a->preferred_until =  now;
 						a->iface = iface;
