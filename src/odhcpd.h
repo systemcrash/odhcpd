@@ -192,6 +192,7 @@ enum odhcpd_mode {
 enum odhcpd_assignment_flags {
 	OAF_DHCPV6_NA		= (1 << 0),
 	OAF_DHCPV6_PD		= (1 << 1),
+	OAF_DHCPV6_ADDR_REG	= (1 << 2),  /* RFC9686 Address Registration */
 };
 
 /* 2-byte type + 128-byte DUID, RFC8415, §11.1 */
@@ -617,6 +618,7 @@ ssize_t dhcpv6_ia_handle_IAs(uint8_t *buf, size_t buflen, struct interface *ifac
 		const struct sockaddr_in6 *addr, const void *data, const uint8_t *end);
 int dhcpv6_ia_init(void);
 int dhcpv6_ia_setup_interface(struct interface *iface, bool enable);
+struct dhcpv6_lease *dhcpv6_alloc_lease(size_t extra_len);
 void dhcpv6_free_lease(struct dhcpv6_lease *lease);
 
 int netlink_add_netevent_handler(struct netevent_handler *hdlr);

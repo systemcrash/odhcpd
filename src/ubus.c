@@ -147,7 +147,12 @@ static int handle_dhcpv6_leases(_o_unused struct ubus_context *ctx, _o_unused st
 			blobmsg_add_u8(&b, "accept-reconf", a->accept_fr_nonce);
 			if (a->flags & OAF_DHCPV6_NA)
 				blobmsg_add_u64(&b, "assigned", a->assigned_host_id);
-			else
+			else if (a->flags & OAF_DHCPV6_ADDR_REG) {
+				/* RFC9686 Address Registration - use full address from peer */
+				char addrbuf[INET6_ADDRSTRLEN];
+				inet_ntop(AF_INET6, &a->peer.sin6_addr, addrbuf, sizeof(addrbuf));
+				blobmsg_add_string(&b, "registered-addr", addrbuf);
+			} else
 				blobmsg_add_u16(&b, "assigned", a->assigned_subnet_id);
 
 			m = blobmsg_open_array(&b, "flags");
@@ -158,8 +163,15 @@ static int handle_dhcpv6_leases(_o_unused struct ubus_context *ctx, _o_unused st
 				blobmsg_add_string(&b, NULL, "static");
 			blobmsg_close_array(&b, m);
 
-			m = blobmsg_open_array(&b, a->flags & OAF_DHCPV6_NA ? "ipv6-addr": "ipv6-prefix");
-			odhcpd_enum_addr6(iface, a, now, dhcpv6_blobmsg_ia_addr, NULL);
+			const char *array_name = "ipv6-prefix";
+			if (a->flags & OAF_DHCPV6_NA)
+				array_name = "ipv6-addr";
+			else if (a->flags & OAF_DHCPV6_ADDR_REG)
+				array_name = "registered-addrs";
+
+			m = blobmsg_open_array(&b, array_name);
+			if (!(a->flags & OAF_DHCPV6_ADDR_REG))
+				odhcpd_enum_addr6(iface, a, now, dhcpv6_blobmsg_ia_addr, NULL);
 			blobmsg_close_array(&b, m);
 
 			blobmsg_add_u32(&b, "valid", INFINITE_VALID(a->valid_until) ?
