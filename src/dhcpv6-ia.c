@@ -1436,6 +1436,8 @@ static bool register_ia_addr_in_lease_db(struct sockaddr_in6 *source,
 /* Send RFC9686 ADDR-REG-REPLY message to client */
 static void send_ia_addr_reg_reply(struct sockaddr_in6 *source,
 		const struct dhcpv6_client_header *hdr,
+		const uint8_t *clientid_data,
+		uint16_t clientid_len,
 		const struct dhcpv6_ia_addr *ia_addr,
 		struct interface *iface)
 {
@@ -1445,21 +1447,52 @@ static void send_ia_addr_reg_reply(struct sockaddr_in6 *source,
 	 * - IA Address option: identical to the one in the request
 	 */
 
-	struct _o_packed {
+	struct {
 		uint8_t msg_type;
 		uint8_t tr_id[3];
-	} reply = {
+	} _o_packed reply = {
 		.msg_type = DHCPV6_MSG_ADDR_REG_REPLY,
 	};
-
 	/* Copy transaction ID from request */
 	memcpy(reply.tr_id, hdr->transaction_id, sizeof(reply.tr_id));
 
-	/* Prepare IA Address option (copy from request) */
-	struct iovec iov[2] = {
-		{&reply, sizeof(reply)},
-		{(void *)ia_addr, sizeof(struct dhcpv6_ia_addr)}
+	struct {
+		uint16_t code;
+		uint16_t len;
+		uint8_t data[DUID_MAX_LEN];
+	} _o_packed serverid = {
+		.code = htons(DHCPV6_OPT_SERVERID),
+		.len = 0,
+		.data = { 0 },
 	};
+
+	if (config.default_duid_len > 0) {
+		memcpy(serverid.data, config.default_duid, config.default_duid_len);
+		serverid.len = htons(config.default_duid_len);
+	} else {
+		uint16_t duid_ll_hdr[] = { htons(DUID_TYPE_LL), htons(ARPHRD_ETHER) };
+		memcpy(serverid.data, duid_ll_hdr, sizeof(duid_ll_hdr));
+		odhcpd_get_mac(iface, &serverid.data[sizeof(duid_ll_hdr)]);
+		serverid.len = htons(sizeof(duid_ll_hdr) + ETH_ALEN);
+	}
+
+	struct iovec iov[IOV_TOTAL] = {
+		[IOV_HDR] = { &reply, sizeof(reply) },
+		[IOV_SERVERID] = { &serverid, sizeof(serverid) },
+		[IOV_CLIENTID] = { &clientid_data, clientid_len },
+		{(void *)ia_addr, sizeof(struct dhcpv6_ia_addr)},
+	};
+
+	size_t serverid_len;
+
+	serverid_len = sizeof(serverid.code) + sizeof(serverid.len) + ntohs(serverid.len);
+	iov[IOV_SERVERID].iov_len = serverid_len;
+
+
+	// /* Prepare IA Address option (copy from request) */
+	// struct iovec iov[2] = {
+	// 	{&reply, sizeof(reply)},
+	// };
 
 	/* RFC9686 §4.3: If not relayed, destination is the address being registered.
 	 * If relayed, we would construct Relay-reply (handled separately in relay_server_response).
@@ -1551,5 +1584,5 @@ void handle_ia_addr_reg_inform(struct sockaddr_in6 *source,
 		return;
 
 	/* Send ADDR-REG-REPLY response */
-	send_ia_addr_reg_reply(source, hdr, ia_addr, iface);
+	send_ia_addr_reg_reply(source, hdr, clientid_data, clientid_len, ia_addr, iface);
 }
