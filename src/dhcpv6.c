@@ -973,6 +973,74 @@ static struct odhcpd_ipaddr *relay_link_address(struct interface *iface)
 	return addr;
 }
 
+/* Recursively validate ADDR-REG-INFORM messages through relay layers.
+ * RFC9686 §4.2.1: The IA Address must match the source address of the
+ * original message (peer-address in innermost relay-forward, or source
+ * IP if not relayed). Returns true if valid, false if should be discarded. */
+static bool validate_addr_reg_inform(const void *data, size_t len,
+				      const struct in6_addr *peer_addr)
+{
+	const struct dhcpv6_relay_header *rh = data;
+	const struct dhcpv6_client_header *ch = data;
+
+	if (len < sizeof(struct dhcpv6_client_header))
+		return false;
+
+	/* If this is a relay-forward, unwrap and recurse */
+	if (rh->msg_type == DHCPV6_MSG_RELAY_FORW) {
+		if (len < sizeof(struct dhcpv6_relay_header))
+			return false;
+
+		uint16_t otype, olen;
+		uint8_t *odata;
+		const uint8_t *end = (const uint8_t *)data + len;
+
+		dhcpv6_for_each_option(rh->options, end, otype, olen, odata) {
+			if (otype == DHCPV6_OPT_RELAY_MSG) {
+				/* Recurse into the inner message with the relay's peer address.
+				 * Copy peer_address to a local aligned buffer to avoid 
+				 * address-of-packed-member warning. */
+				struct in6_addr peer;
+				memcpy(&peer, &rh->peer_address, sizeof(peer));
+				return validate_addr_reg_inform(odata, olen, &peer);
+			}
+		}
+		/* No relay message option found */
+		return false;
+	}
+
+	/* We've reached the innermost client message */
+	if (ch->msg_type != DHCPV6_MSG_ADDR_REG_INFORM)
+		return true; /* Not an ADDR-REG-INFORM, no validation needed */
+
+	/* Validate that IA_ADDR matches peer address */
+	uint16_t otype, olen;
+	uint8_t *odata;
+	const uint8_t *start = (const uint8_t *)&ch[1];
+	const uint8_t *end = (const uint8_t *)data + len;
+
+	dhcpv6_for_each_option(start, end, otype, olen, odata) {
+		if (otype != DHCPV6_OPT_IA_NA)
+			continue;
+
+		struct dhcpv6_ia_hdr *ia = (struct dhcpv6_ia_hdr *)&odata[-4];
+		uint8_t *sdata;
+		uint16_t stype, slen;
+
+		dhcpv6_for_each_sub_option(&ia[1], odata + olen, stype, slen, sdata) {
+			if (stype != DHCPV6_OPT_IA_ADDR || slen < sizeof(struct dhcpv6_ia_addr) - 4)
+				continue;
+
+			struct dhcpv6_ia_addr *ia_addr = (struct dhcpv6_ia_addr *)&sdata[-4];
+			/* RFC9686 §4.2.1: IA Address must match source/peer address */
+			if (memcmp(&ia_addr->addr, peer_addr, sizeof(struct in6_addr)) != 0)
+				return false;
+		}
+	}
+
+	return true;
+}
+
 /* Relay client request (regular DHCPv6-relay) */
 static void relay_client_request(struct sockaddr_in6 *source,
 		const void *data, size_t len, struct interface *iface)
@@ -1025,6 +1093,14 @@ static void relay_client_request(struct sockaddr_in6 *source,
 			return; /* Invalid hop count */
 
 		hdr.hop_count = h->hop_count + 1;
+	}
+
+	/* RFC9686 §4.2 "fate sharing" or §4.2.1
+	 * Validate ADDR-REG-INFORM messages recursively through relay layers.
+	 * The IA Address must match the source address of the original message. */
+	if (!validate_addr_reg_inform(data, len, &source->sin6_addr)) {
+		notice("DHCPv6-relay: Discarding ADDR-REG-INFORM: address does not match source");
+		return;
 	}
 
 	/* use memcpy here as the destination fields are unaligned */
