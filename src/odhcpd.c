@@ -694,6 +694,12 @@ void odhcpd_enum_addr6(struct interface *iface, struct dhcpv6_lease *lease,
 				continue;
 
 			addr = in6_from_prefix_and_iid(&addrs[i], lease->assigned_host_id);
+		} else if (lease->flags & OAF_DHCPV6_ADDR_REG) {
+			/* RFC9686 Address Registration - use full address from peer */
+			addr = lease->peer.sin6_addr;
+			/* For address registration, we only enumerate once with the registered address */
+			if (i > 0)
+				continue;
 		} else {
 			if (!valid_prefix_length(lease, addrs[i].prefix_len))
 				continue;

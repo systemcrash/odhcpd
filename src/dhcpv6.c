@@ -33,6 +33,9 @@ static void relay_client_request(struct sockaddr_in6 *source,
 		const void *data, size_t len, struct interface *iface);
 static void relay_server_response(uint8_t *data, size_t len);
 
+void handle_ia_addr_reg_inform(struct sockaddr_in6 *source,
+		const void *data, size_t len, struct interface *iface);
+
 static void handle_dhcpv6(void *addr, void *data, size_t len,
 		struct interface *iface, void *dest);
 static void handle_client_request(void *addr, void *data, size_t len,
@@ -169,6 +172,7 @@ enum {
 	IOV_MAXRT,
 #define IOV_STAT IOV_MAXRT
 	IOV_RAPID_COMMIT,
+	IOV_ADDR_REG_ENABLE,
 	IOV_DNS,
 	IOV_DNS_ADDR,
 	IOV_SEARCH,
@@ -347,6 +351,7 @@ static void handle_client_request(void *addr, void *data, size_t len,
 	/* if we include DHCPV4 support, handle this message type */
 	case DHCPV6_MSG_DHCPV4_QUERY:
 #endif
+	case DHCPV6_MSG_ADDR_REG_INFORM:
 		break;
 	/* Invalid message types for clients i.e. server messages */
 	case DHCPV6_MSG_ADVERTISE:
@@ -358,11 +363,20 @@ static void handle_client_request(void *addr, void *data, size_t len,
 	case DHCPV6_MSG_DHCPV4_QUERY:
 #endif
 	case DHCPV6_MSG_DHCPV4_RESPONSE:
+	case DHCPV6_MSG_ADDR_REG_REPLY:
 	default:
 		return;
 	}
 
 	debug("Got a DHCPv6-request on %s", iface->name);
+
+	/* RFC9686 - Handle ADDR-REG-INFORM separately */
+	if (hdr->msg_type == DHCPV6_MSG_ADDR_REG_INFORM) {
+		if (iface->dhcpv6 == MODE_SERVER) {
+			handle_ia_addr_reg_inform((struct sockaddr_in6 *)addr, data, len, iface);
+		}
+		return;
+	}
 
 	/* Construct reply message */
 	struct _o_packed {
@@ -501,6 +515,16 @@ static void handle_client_request(void *addr, void *data, size_t len,
 		uint16_t len;
 	} capt_portal;
 
+	/* RFC9686 Address Registration Enable option */
+	bool addr_reg_enable_want = false;
+	struct {
+		uint16_t type;
+		uint16_t len;
+	} addr_reg_enable = {
+		htons(DHCPV6_OPT_ADDR_REG_ENABLE),
+		0
+	};
+
 	/* RFC8910 §2:
 	 * DHCP servers MAY send the Captive Portal option without any explicit request
 	 * If it is configured, send it.
@@ -611,6 +635,10 @@ static void handle_client_request(void *addr, void *data, size_t len,
 				memcpy(&d6dnr->len, &d6dnr_len_be, sizeof(d6dnr_len_be));
 			}
 			break;
+		case DHCPV6_OPT_ADDR_REG_ENABLE:
+			/* RFC9686: Signal address registration support */
+			addr_reg_enable_want = true;
+			break;
 		}
 	}
 
@@ -652,6 +680,7 @@ static void handle_client_request(void *addr, void *data, size_t len,
 		[IOV_DNS_ADDR] = { dns_addrs6, dns_addrs6_cnt * sizeof(*dns_addrs6) },
 		[IOV_SEARCH] = { &dns_search_hdr, (dns_search_len) ? sizeof(dns_search_hdr) : 0 },
 		[IOV_SEARCH_DOMAIN] = { dns_search, dns_search_len },
+		[IOV_ADDR_REG_ENABLE] = {&addr_reg_enable, addr_reg_enable_want ? sizeof(addr_reg_enable) : 0},
 		[IOV_PDBUF] = {pdbuf, 0},
 		[IOV_DHCPV6_RAW] = {iface->dhcpv6_raw, iface->dhcpv6_raw_len},
 		[IOV_NTP] = {&ntp, (ntp_cnt) ? sizeof(ntp) : 0},
@@ -798,6 +827,7 @@ static void handle_client_request(void *addr, void *data, size_t len,
 				      iov[IOV_RAPID_COMMIT].iov_len + iov[IOV_DNS].iov_len +
 				      iov[IOV_DNS_ADDR].iov_len + iov[IOV_SEARCH].iov_len +
 				      iov[IOV_SEARCH_DOMAIN].iov_len + iov[IOV_PDBUF].iov_len +
+				      iov[IOV_ADDR_REG_ENABLE].iov_len +
 				      iov[IOV_DHCPV4O6_SERVER].iov_len +
 				      iov[IOV_DHCPV6_RAW].iov_len +
 				      iov[IOV_NTP].iov_len + iov[IOV_NTP_ADDR].iov_len +
@@ -873,6 +903,10 @@ static void relay_server_response(uint8_t *data, size_t len)
 	/* If the payload is relay-reply we have to send to the server port */
 	if (payload_data[0] == DHCPV6_MSG_RELAY_REPL) {
 		target.sin6_port = htons(DHCPV6_SERVER_PORT);
+	} else if (payload_data[0] == DHCPV6_MSG_ADDR_REG_REPLY) {
+		/* RFC9686: Forward ADDR-REG-REPLY back to client */
+		/* The client address is in the peer_address field of the relay message */
+		/* For relayed ADDR-REG-REPLY, just forward as-is to client port */
 	} else { /* Go through the payload data */
 		struct dhcpv6_client_header *dch = (void*)payload_data;
 		end = payload_data + payload_len;
@@ -970,6 +1004,7 @@ static void relay_client_request(struct sockaddr_in6 *source,
 	case DHCPV6_MSG_INFORMATION_REQUEST:
 	case DHCPV6_MSG_RELAY_FORW:
 	case DHCPV6_MSG_DHCPV4_QUERY:
+	case DHCPV6_MSG_ADDR_REG_INFORM:
 		break;
 	/* Invalid message types from clients i.e. server messages */
 	case DHCPV6_MSG_ADVERTISE:
@@ -977,6 +1012,7 @@ static void relay_client_request(struct sockaddr_in6 *source,
 	case DHCPV6_MSG_RECONFIGURE:
 	case DHCPV6_MSG_RELAY_REPL:
 	case DHCPV6_MSG_DHCPV4_RESPONSE:
+	case DHCPV6_MSG_ADDR_REG_REPLY:
 		return;
 	default:
 		break;
